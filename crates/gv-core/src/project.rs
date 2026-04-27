@@ -70,9 +70,14 @@ impl ToolSpec {
     }
 }
 
-/// Walk up from `start` looking for a project root (first dir with `go.mod` or
-/// `gv.toml`).
+/// Walk up from `start` looking for a project root.
+///
+/// `go.work` wins (workspace root holds the shared `gv.toml` / `gv.lock`).
+/// Otherwise the first dir with `gv.toml` or `go.mod`.
 pub fn find_root(start: &Path) -> Option<PathBuf> {
+    if let Some(ws) = crate::workspace::find_workspace_root(start) {
+        return Some(ws);
+    }
     let mut dir: Option<&Path> = Some(start);
     while let Some(d) = dir {
         if d.join(PROJECT_FILE).is_file() || d.join("go.mod").is_file() {

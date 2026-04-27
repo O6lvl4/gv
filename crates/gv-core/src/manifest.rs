@@ -15,15 +15,43 @@ pub struct ToolchainHit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolchainSource {
     EnvVar,
+    GoWork,
     GoMod,
     GoVersionFile,
     Global,
     LatestInstalled,
 }
 
-/// Walk up from `start` looking for `go.mod` (read its `toolchain` line) or
-/// `.go-version`. Returns the first hit.
+/// Walk up from `start` looking for the most authoritative toolchain pin.
+///
+/// Order of precedence (highest first):
+/// 1. `go.work` `toolchain` line (workspace-wide)
+/// 2. `go.mod` `toolchain` line at the nearest module
+/// 3. `.go-version`
+///
+/// `go.work` wins because Go itself overrides per-member `go.mod` toolchain
+/// pins when in workspace mode.
 pub fn find_project_toolchain(start: &Path) -> Result<Option<ToolchainHit>> {
+    // Pass 1 — look for go.work anywhere in the ancestor chain.
+    let mut dir: Option<&Path> = Some(start);
+    while let Some(d) = dir {
+        let go_work = d.join(crate::workspace::WORKSPACE_FILE);
+        if go_work.is_file() {
+            let work = crate::workspace::load(d)?;
+            if let Some(v) = work.toolchain {
+                return Ok(Some(ToolchainHit {
+                    version: v,
+                    source: ToolchainSource::GoWork,
+                    origin: go_work,
+                }));
+            }
+            // go.work without a toolchain line: keep searching go.mod / .go-version.
+            break;
+        }
+        dir = d.parent();
+    }
+
+    // Pass 2 — fall back to per-module pins.
     let mut dir: Option<&Path> = Some(start);
     while let Some(d) = dir {
         let go_mod = d.join("go.mod");

@@ -128,6 +128,13 @@ enum Cmd {
     /// versions, without modifying anything. Exits non-zero if anything is
     /// behind (suitable for CI gating).
     Outdated,
+    /// Print shell-evaluable exports for the resolved toolchain. Useful when
+    /// a tool needs to run *outside* `gv run`. e.g. `eval "$(gv env)"`.
+    Env {
+        /// Output dialect.
+        #[arg(long, value_enum, default_value_t = EnvShell::Sh)]
+        shell: EnvShell,
+    },
     /// Import tools from a `tools.go` (with `//go:build tools`) and pin them
     /// in gv.toml. Run `gv sync` afterwards to install.
     MigrateTools {
@@ -157,7 +164,17 @@ enum CacheCmd {
         /// Show what would be removed without doing it.
         #[arg(long)]
         dry_run: bool,
+        /// Also wipe the Go build cache (GOCACHE). Go re-creates it lazily.
+        #[arg(long)]
+        go_cache: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum EnvShell {
+    Sh,
+    Fish,
+    Powershell,
 }
 
 #[derive(Debug, Subcommand)]
@@ -232,9 +249,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Upgrade { names, toolchain } => cmd_upgrade(&paths, platform, names, toolchain).await,
         Cmd::Cache { op } => match op {
             CacheCmd::Info => cmd_cache_info(&paths),
-            CacheCmd::Prune { dry_run } => cmd_cache_prune(&paths, dry_run),
+            CacheCmd::Prune { dry_run, go_cache } => cmd_cache_prune(&paths, dry_run, go_cache),
         },
         Cmd::Outdated => cmd_outdated(&paths, platform).await,
+        Cmd::Env { shell } => cmd_env(&paths, shell),
         Cmd::MigrateTools { from, dry_run } => cmd_migrate_tools(from, dry_run).await,
         Cmd::Completions { shell } => cmd_completions(shell),
         Cmd::Doctor => cmd_doctor(&paths, platform),
@@ -459,6 +477,10 @@ fn cmd_current(paths: &Paths) -> Result<ExitCode> {
             println!("{}", r.version);
             let why = match r.source {
                 ToolchainSource::EnvVar => "GV_VERSION".to_string(),
+                ToolchainSource::GoWork => format!(
+                    "go.work toolchain ({})",
+                    r.origin.as_deref().map(display_path).unwrap_or_default()
+                ),
                 ToolchainSource::GoMod => format!(
                     "go.mod toolchain ({})",
                     r.origin.as_deref().map(display_path).unwrap_or_default()
@@ -1434,6 +1456,27 @@ fn cmd_tree(paths: &Paths) -> Result<ExitCode> {
 
     println!("{}", color_bold("gv tree"));
 
+    // Workspace branch — only emitted if a go.work exists at the resolved root.
+    if let Some(r) = root.as_deref() {
+        let go_work = r.join(gv_core::workspace::WORKSPACE_FILE);
+        if go_work.is_file() {
+            let work = gv_core::workspace::load(r)?;
+            println!(
+                "├── {} {} ({})",
+                color_cyan("workspace"),
+                r.display(),
+                dim(&format!(
+                    "{} member{}",
+                    work.members.len(),
+                    plural(work.members.len())
+                ))
+            );
+            for m in &work.members {
+                println!("│   ├── {}", m.display());
+            }
+        }
+    }
+
     // Toolchain branch
     let resolved = resolve::resolve(paths, &cwd)?;
     match resolved.as_ref() {
@@ -1492,6 +1535,10 @@ fn source_label(r: &resolve::Resolved) -> String {
     use ToolchainSource::*;
     match r.source {
         EnvVar => "GV_VERSION".into(),
+        GoWork => format!(
+            "go.work toolchain ({})",
+            r.origin.as_deref().map(display_path).unwrap_or_default()
+        ),
         GoMod => format!(
             "go.mod toolchain ({})",
             r.origin.as_deref().map(display_path).unwrap_or_default()
@@ -1683,16 +1730,87 @@ async fn cmd_upgrade(
     Ok(ExitCode::SUCCESS)
 }
 
+// ----- gv env ---------------------------------------------------------------
+
+fn cmd_env(paths: &Paths, shell: EnvShell) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let r = resolve::resolve(paths, &cwd)?
+        .ok_or_else(|| anyhow!("no Go version resolved in {}", cwd.display()))?;
+    let goroot = paths.version_dir(&r.version);
+    let bin_dir = goroot.join("bin");
+
+    match shell {
+        EnvShell::Sh => {
+            println!("export GOROOT={}", quote_sh(&goroot.display().to_string()));
+            println!("export GOTOOLCHAIN=local");
+            println!(
+                "export PATH={}:\"$PATH\"",
+                quote_sh(&bin_dir.display().to_string())
+            );
+        }
+        EnvShell::Fish => {
+            println!("set -gx GOROOT {}", quote_sh(&goroot.display().to_string()));
+            println!("set -gx GOTOOLCHAIN local");
+            println!(
+                "set -gx PATH {} $PATH",
+                quote_sh(&bin_dir.display().to_string())
+            );
+        }
+        EnvShell::Powershell => {
+            println!("$env:GOROOT = {}", quote_ps(&goroot.display().to_string()));
+            println!("$env:GOTOOLCHAIN = 'local'");
+            println!(
+                "$env:Path = {} + ';' + $env:Path",
+                quote_ps(&bin_dir.display().to_string())
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn quote_sh(s: &str) -> String {
+    // Single-quote, escape any embedded single quotes.
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+fn quote_ps(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 // ----- gv cache -------------------------------------------------------------
 
+fn go_cache_dirs() -> (Option<PathBuf>, Option<PathBuf>) {
+    let gomod = std::env::var_os("GOMODCACHE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("GOPATH")
+                .map(|p| PathBuf::from(p).join("pkg").join("mod"))
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|h| PathBuf::from(h).join("go").join("pkg").join("mod"))
+                })
+        });
+    let gocache = std::env::var_os("GOCACHE").map(PathBuf::from).or_else(|| {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("go-build"))
+    });
+    (gomod, gocache)
+}
+
 fn cmd_cache_info(paths: &Paths) -> Result<ExitCode> {
-    let entries = [
-        ("store    ", paths.store()),
-        ("versions ", paths.versions()),
-        ("tools    ", paths.data.join("tools")),
-        ("cache    ", paths.cache.clone()),
-        ("config   ", paths.config.clone()),
+    let mut entries: Vec<(String, PathBuf)> = vec![
+        ("store    ".into(), paths.store()),
+        ("versions ".into(), paths.versions()),
+        ("tools    ".into(), paths.data.join("tools")),
+        ("cache    ".into(), paths.cache.clone()),
+        ("config   ".into(), paths.config.clone()),
     ];
+    let (gomod, gocache) = go_cache_dirs();
+    if let Some(p) = gomod {
+        entries.push(("GOMODCACHE".into(), p));
+    }
+    if let Some(p) = gocache {
+        entries.push(("GOCACHE   ".into(), p));
+    }
+
     println!("{}", color_bold("gv cache"));
     let mut total: u64 = 0;
     for (label, path) in &entries {
@@ -1712,10 +1830,14 @@ fn cmd_cache_info(paths: &Paths) -> Result<ExitCode> {
         );
     }
     println!("  {} {:>10}", color_bold("total    "), humanize(total));
+    println!(
+        "{}",
+        dim("    note: GOMODCACHE is shared with system Go installs; gv won't auto-prune it")
+    );
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_cache_prune(paths: &Paths, dry_run: bool) -> Result<ExitCode> {
+fn cmd_cache_prune(paths: &Paths, dry_run: bool, go_cache: bool) -> Result<ExitCode> {
     let store = paths.store();
     let versions = paths.versions();
     if !store.exists() {
@@ -1769,6 +1891,36 @@ fn cmd_cache_prune(paths: &Paths, dry_run: bool) -> Result<ExitCode> {
         if to_remove.len() == 1 { "y" } else { "ies" },
         humanize(total)
     );
+
+    if go_cache {
+        let (_, gocache) = go_cache_dirs();
+        if let Some(p) = gocache {
+            if p.is_dir() {
+                let (size, _) = dir_size(&p)?;
+                if dry_run {
+                    println!(
+                        "  {} {:>10}  {} {}",
+                        verb,
+                        humanize(size),
+                        p.display(),
+                        dim("(GOCACHE)")
+                    );
+                } else {
+                    std::fs::remove_dir_all(&p)
+                        .with_context(|| format!("remove {}", p.display()))?;
+                    println!(
+                        "{} wiped GOCACHE at {} ({})",
+                        success_mark(),
+                        p.display(),
+                        humanize(size)
+                    );
+                }
+            } else {
+                println!("{}", dim("    GOCACHE not present, nothing to wipe"));
+            }
+        }
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 

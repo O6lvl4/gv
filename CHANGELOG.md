@@ -6,6 +6,33 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-27
+
+### Added
+
+- **`go.work` workspace support** — when a `go.work` file exists in any
+  ancestor of the cwd, `gv` treats that directory as the project root.
+  The workspace's `toolchain` line takes precedence over per-member
+  `go.mod` toolchain pins (matching Go's runtime semantics in workspace
+  mode). `gv tree` adds a top-level `workspace` branch listing every
+  `use ./path` member.
+- **`gv env [--shell sh|fish|powershell]`** — emit shell-evaluable
+  exports for `GOROOT`, `GOTOOLCHAIN=local`, and a PATH that prepends
+  the toolchain's `bin/`. `eval "$(gv env)"` lets tools that don't go
+  through `gv run` still see the right Go.
+- **`gv cache info` reports GOMODCACHE + GOCACHE** (resolved from env
+  vars, GOPATH, or the default `~/go/pkg/mod` / `~/.cache/go-build`).
+  Disclaims that GOMODCACHE is shared with system Go and gv won't
+  auto-prune it.
+- **`gv cache prune --go-cache`** — opt-in wipe of the Go build cache
+  (Go re-creates it lazily). Stays separate from store pruning so users
+  consciously trigger the second-order disk reclaim.
+
+### Changed
+
+- `ToolchainSource::GoWork` joins the existing source enum (visible in
+  `gv current`/`gv tree` output as `go.work toolchain (path)`).
+
 ## [0.3.0] — 2026-04-27
 
 ### Added

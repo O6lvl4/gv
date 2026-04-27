@@ -12,6 +12,7 @@ pub mod release;
 pub mod resolve;
 pub mod store;
 pub mod tool;
+pub mod workspace;
 
 pub use paths::Paths;
 pub use platform::Platform;
