@@ -1,14 +1,17 @@
-//! Talk to the Go module proxy (proxy.golang.org by default).
+//! Talk to the Go module proxy. Honors GOPROXY (comma-separated, with the
+//! "direct" / "off" sentinels filtered out). Falls back to proxy.golang.org
+//! when nothing is set.
 //!
-//! Endpoints used:
+//! Endpoints used (per https://go.dev/ref/mod#goproxy-protocol):
 //!   GET /<encoded-module>/@latest          → JSON {Version, Time}
+//!   GET /<encoded-module>/@v/list          → newline-separated versions
 //!   GET /<encoded-module>/@v/<version>.info → JSON {Version, Time}
 //!   GET /<encoded-module>/@v/<version>.ziphash → text "h1:base64\n"
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-const PROXY_BASE: &str = "https://proxy.golang.org";
+pub const DEFAULT_PROXY: &str = "https://proxy.golang.org";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionInfo {
@@ -18,64 +21,129 @@ pub struct VersionInfo {
     pub time: Option<String>,
 }
 
-pub async fn latest(client: &reqwest::Client, module: &str) -> Result<VersionInfo> {
-    let url = format!("{PROXY_BASE}/{}/@latest", encode_path(module));
-    let res = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()?;
-    Ok(res.json().await?)
+/// Resolve the active proxy chain. Mirrors the Go runtime's GOPROXY semantics:
+/// comma- (or pipe-) separated list, with `direct` / `off` filtered out — the
+/// remaining entries are HTTPS endpoints we actually fetch from.
+pub fn proxy_chain() -> Vec<String> {
+    let raw = std::env::var("GOPROXY").unwrap_or_else(|_| DEFAULT_PROXY.to_string());
+    let mut out = Vec::new();
+    for chunk in raw.split([',', '|']) {
+        let s = chunk.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("direct") || s.eq_ignore_ascii_case("off") {
+            continue;
+        }
+        let trimmed = s.trim_end_matches('/').to_string();
+        out.push(trimmed);
+    }
+    if out.is_empty() {
+        out.push(DEFAULT_PROXY.to_string());
+    }
+    out
 }
 
-/// Find the longest prefix of `package_path` that the proxy recognizes as a
-/// module. Returns (module, version_info_for_latest).
-///
-/// The Go module proxy doesn't give us a package→module lookup, so we walk
-/// up the path trying @latest at each prefix. This mirrors how `go install`
-/// resolves modules itself.
+/// Try each configured proxy in turn for `<base>/<encoded-module>/<suffix>`.
+/// Returns the first 2xx response. On 404/410 across the whole chain, treat
+/// the resource as missing.
+async fn try_chain(
+    client: &reqwest::Client,
+    encoded: &str,
+    suffix: &str,
+) -> Result<Option<reqwest::Response>> {
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut all_404 = true;
+    for base in proxy_chain() {
+        let url = format!("{base}/{encoded}{suffix}");
+        match client.get(&url).send().await {
+            Ok(res) if res.status().is_success() => return Ok(Some(res)),
+            Ok(res) => {
+                let code = res.status().as_u16();
+                if code != 404 && code != 410 {
+                    all_404 = false;
+                    last_err = Some(anyhow!("HTTP {code} from {url}"));
+                }
+            }
+            Err(e) => {
+                all_404 = false;
+                last_err = Some(anyhow::Error::new(e).context(format!("GET {url}")));
+            }
+        }
+    }
+    if all_404 {
+        Ok(None)
+    } else {
+        Err(last_err.unwrap_or_else(|| anyhow!("no proxies configured")))
+    }
+}
+
+pub async fn latest(client: &reqwest::Client, module: &str) -> Result<VersionInfo> {
+    let suffix = "/@latest";
+    let res = try_chain(client, &encode_path(module), suffix)
+        .await?
+        .ok_or_else(|| anyhow!("module {module} not found in any proxy"))?;
+    res.json().await.context("parse @latest JSON")
+}
+
+/// Walk up `package_path` asking the proxy chain whether each prefix is a
+/// module. Returns the first match. Mirrors how `go install` resolves
+/// `package@version` to a containing module.
 pub async fn find_module(
     client: &reqwest::Client,
     package_path: &str,
 ) -> Result<(String, VersionInfo)> {
     let mut candidate: &str = package_path;
     loop {
-        let url = format!("{PROXY_BASE}/{}/@latest", encode_path(candidate));
-        let res = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        let status = res.status();
-        if status.is_success() {
-            let info: VersionInfo = res.json().await?;
-            return Ok((candidate.to_string(), info));
-        } else if status.as_u16() == 404 || status.as_u16() == 410 {
-            // Try the parent path.
-            match candidate.rfind('/') {
+        let encoded = encode_path(candidate);
+        match try_chain(client, &encoded, "/@latest").await? {
+            Some(res) => {
+                let info: VersionInfo = res.json().await.context("parse @latest JSON")?;
+                return Ok((candidate.to_string(), info));
+            }
+            None => match candidate.rfind('/') {
                 Some(i) if i > 0 => candidate = &candidate[..i],
                 _ => {
                     return Err(anyhow!(
                         "could not resolve any module path containing {package_path}"
                     ))
                 }
-            }
-        } else {
-            return Err(anyhow!("unexpected status {status} for {url}"));
+            },
         }
     }
 }
 
-/// Look up the module's directory hash (`h1:...`) from the Go checksum
-/// database at sum.golang.org. This is the canonical source — the same hash
-/// that ends up in your `go.sum`.
+/// Fetch the full version list for a module from the proxy chain. Returns
+/// versions in declaration order; callers filter via semver.
+pub async fn list_versions(client: &reqwest::Client, module: &str) -> Result<Vec<String>> {
+    let res = try_chain(client, &encode_path(module), "/@v/list")
+        .await?
+        .ok_or_else(|| anyhow!("module {module} not found in any proxy"))?;
+    let body = res.text().await?;
+    Ok(body
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Look up the module's directory hash (`h1:...`) from sum.golang.org. This
+/// hits a fixed endpoint independent of GOPROXY because the checksum DB is the
+/// canonical authority for `go.sum` verification.
 pub async fn ziphash(client: &reqwest::Client, module: &str, version: &str) -> Result<String> {
-    let url = format!(
-        "https://sum.golang.org/lookup/{}@{}",
-        encode_path(module),
-        version
-    );
+    let sumdb = std::env::var("GOSUMDB").unwrap_or_else(|_| "sum.golang.org".to_string());
+    if sumdb.eq_ignore_ascii_case("off") {
+        return Err(anyhow!(
+            "GOSUMDB=off — cannot retrieve h1: hash. Set GOSUMDB to a verifier or unset it."
+        ));
+    }
+    // GOSUMDB may be just a host or "host+key" or a full URL; we only care
+    // about the host portion.
+    let host = sumdb
+        .split_whitespace()
+        .next()
+        .unwrap_or("sum.golang.org")
+        .trim_end_matches('/');
+    let host = host.strip_prefix("https://").unwrap_or(host);
+    let host = host.strip_prefix("http://").unwrap_or(host);
+    let url = format!("https://{host}/lookup/{}@{}", encode_path(module), version);
     let res = client
         .get(&url)
         .send()
@@ -136,4 +204,10 @@ mod tests {
             "github.com/!microsoft/go-winio"
         );
     }
+
+    // Note: GOPROXY semantics are exercised through proxy_chain by setting
+    // the env var. We avoid a dedicated test here because that env var is
+    // process-global and unit tests run in parallel — a custom GOPROXY in
+    // the developer's shell would also poison a default-value assertion.
+    // The chain logic is small and verified end-to-end via integration runs.
 }

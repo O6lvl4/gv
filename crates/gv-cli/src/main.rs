@@ -124,6 +124,26 @@ enum Cmd {
         #[command(subcommand)]
         op: CacheCmd,
     },
+    /// Show pinned tools / toolchain that are behind their latest available
+    /// versions, without modifying anything. Exits non-zero if anything is
+    /// behind (suitable for CI gating).
+    Outdated,
+    /// Import tools from a `tools.go` (with `//go:build tools`) and pin them
+    /// in gv.toml. Run `gv sync` afterwards to install.
+    MigrateTools {
+        /// Path to the tools.go file. Defaults to scanning the project root
+        /// for any file with the `//go:build tools` constraint.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Don't write gv.toml, just print what would be added.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate shell completions for `gv`.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Health check.
     Doctor,
 }
@@ -214,8 +234,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             CacheCmd::Info => cmd_cache_info(&paths),
             CacheCmd::Prune { dry_run } => cmd_cache_prune(&paths, dry_run),
         },
+        Cmd::Outdated => cmd_outdated(&paths, platform).await,
+        Cmd::MigrateTools { from, dry_run } => cmd_migrate_tools(from, dry_run).await,
+        Cmd::Completions { shell } => cmd_completions(shell),
         Cmd::Doctor => cmd_doctor(&paths, platform),
     }
+}
+
+fn cmd_completions(shell: clap_complete::Shell) -> Result<ExitCode> {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let bin_name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn default_bin_dir() -> Result<PathBuf> {
@@ -1004,6 +1034,285 @@ fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
         std::fs::set_permissions(dest, perms)?;
     }
     Ok(())
+}
+
+// ----- gv outdated ----------------------------------------------------------
+
+async fn cmd_outdated(paths: &Paths, _platform: Platform) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let root = project::find_root(&cwd).ok_or_else(|| {
+        anyhow!(
+            "no project root found (need a go.mod or gv.toml above {})",
+            cwd.display()
+        )
+    })?;
+    let proj = project::load(&root)?;
+    let lock = Lock::load(&root)?;
+    let client = http_client()?;
+
+    let mut rows: Vec<(String, String, String, bool)> = Vec::new();
+
+    // Toolchain
+    let pb = spinner("checking toolchain");
+    let releases = release::fetch_index(&client).await?;
+    pb.finish_and_clear();
+    let latest_go =
+        release::latest_stable(&releases).ok_or_else(|| anyhow!("no stable Go release found"))?;
+    let cur_go = resolve::resolve(paths, &root)?.map(|r| r.version);
+    if let Some(cur) = cur_go {
+        let behind = cur != latest_go.version;
+        rows.push((
+            "toolchain".to_string(),
+            cur,
+            latest_go.version.clone(),
+            behind,
+        ));
+    }
+
+    // Tools (parallel @latest fetches)
+    if !proj.tools.is_empty() {
+        let pb = spinner(&format!(
+            "checking {} tool(s) for updates",
+            proj.tools.len()
+        ));
+        let futs = proj.tools.keys().map(|name| {
+            let client = client.clone();
+            let name = name.clone();
+            async move {
+                let resolved =
+                    tool::resolve(&client, &name, &ToolSpec::Short("latest".into())).await?;
+                Ok::<_, anyhow::Error>((name, resolved.version))
+            }
+        });
+        let resolved: Vec<(String, String)> = try_join_all(futs).await?;
+        pb.finish_and_clear();
+        for (name, latest) in resolved {
+            let locked = lock
+                .find_tool(&name)
+                .map(|t| t.version.clone())
+                .unwrap_or_else(|| "—".to_string());
+            let behind = locked != latest;
+            rows.push((name, locked, latest, behind));
+        }
+    }
+
+    if rows.is_empty() {
+        println!("{}", dim("(nothing to check)"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let any_behind = rows.iter().any(|(_, _, _, b)| *b);
+    let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
+    let cur_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(6);
+    let new_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(6);
+    println!(
+        "{:<name_w$}  {:<cur_w$}  {:<new_w$}  {}",
+        color_bold("NAME"),
+        color_bold("LOCKED"),
+        color_bold("LATEST"),
+        color_bold("STATUS"),
+        name_w = name_w,
+        cur_w = cur_w,
+        new_w = new_w
+    );
+    for (name, locked, latest, behind) in &rows {
+        let mark = if *behind {
+            color_yellow("behind")
+        } else {
+            color_green("up to date")
+        };
+        println!(
+            "{:<name_w$}  {:<cur_w$}  {:<new_w$}  {}",
+            name,
+            locked,
+            latest,
+            mark,
+            name_w = name_w,
+            cur_w = cur_w,
+            new_w = new_w
+        );
+    }
+
+    if any_behind {
+        println!();
+        println!("{} run `gv upgrade` to bump", dim("→"));
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+// ----- gv migrate-tools -----------------------------------------------------
+
+async fn cmd_migrate_tools(from: Option<PathBuf>, dry_run: bool) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let root = project::find_root(&cwd).ok_or_else(|| {
+        anyhow!(
+            "no project root found (need a go.mod or gv.toml above {})",
+            cwd.display()
+        )
+    })?;
+
+    let candidates: Vec<PathBuf> = match from {
+        Some(p) => vec![p],
+        None => find_tools_go_files(&root)?,
+    };
+    if candidates.is_empty() {
+        bail!(
+            "no tools.go-style file found under {}. Pass --from <path> if it lives elsewhere.",
+            root.display()
+        );
+    }
+
+    let mut imports: Vec<String> = Vec::new();
+    for path in &candidates {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        if !looks_like_tools_file(&text) {
+            continue;
+        }
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(pkg) = parse_blank_import(trimmed) {
+                imports.push(pkg.to_string());
+            }
+        }
+    }
+
+    if imports.is_empty() {
+        bail!("no `_ \"…\"` imports found under a `//go:build tools` constraint");
+    }
+
+    let client = http_client()?;
+    let mut additions: Vec<(String, String)> = Vec::new(); // (gv name, package)
+    let pb = spinner(&format!("resolving {} import(s)", imports.len()));
+    for pkg in &imports {
+        let (_module, _info) = gv_core::proxy::find_module(&client, pkg).await?;
+        let name = derive_tool_name(pkg);
+        additions.push((name, pkg.clone()));
+    }
+    pb.finish_and_clear();
+
+    let mut proj = project::load(&root)?;
+    let mut new_count = 0usize;
+    for (name, pkg) in &additions {
+        if proj.tools.contains_key(name) {
+            println!(
+                "{} {} {}",
+                dim("="),
+                name,
+                dim(&format!("(already pinned, skipping {pkg})"))
+            );
+            continue;
+        }
+        // If the import path matches the registry's package, use a Short spec;
+        // otherwise emit a Long spec with explicit package so reproducibility
+        // doesn't depend on the registry.
+        let spec = if gv_core::registry::lookup(name)
+            .map(|e| e.package == pkg.as_str())
+            .unwrap_or(false)
+        {
+            ToolSpec::Short("latest".into())
+        } else {
+            ToolSpec::Long {
+                package: Some(pkg.clone()),
+                version: "latest".into(),
+                bin: None,
+            }
+        };
+        proj.tools.insert(name.clone(), spec);
+        new_count += 1;
+        println!("{} {} = \"{}\"", color_green("+"), name, pkg);
+    }
+
+    if new_count == 0 {
+        println!("{}", dim("(nothing new to migrate)"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if dry_run {
+        println!("{}", dim("    --dry-run: gv.toml unchanged"));
+    } else {
+        project::save(&root, &proj)?;
+        println!(
+            "{} pinned {} new tool(s) in {}",
+            success_mark(),
+            new_count,
+            root.join("gv.toml").display()
+        );
+        println!("{}", dim("    next: run `gv sync` to install them"));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn find_tools_go_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in walk_files(root, 3) {
+        let path = entry;
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.ends_with(".go"))
+            .unwrap_or(false)
+        {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if looks_like_tools_file(&content) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn walk_files(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "vendor" || name == "node_modules" {
+                continue;
+            }
+            if p.is_dir() {
+                if depth < max_depth {
+                    stack.push((p, depth + 1));
+                }
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn looks_like_tools_file(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim();
+        t == "//go:build tools" || t == "// +build tools"
+    })
+}
+
+fn parse_blank_import(line: &str) -> Option<&str> {
+    let s = line.strip_prefix('_')?.trim_start();
+    let s = s.strip_prefix('"')?;
+    let end = s.find('"')?;
+    Some(&s[..end])
+}
+
+fn derive_tool_name(pkg: &str) -> String {
+    // Match Go's `go install` convention: the last path segment, ignoring a
+    // trailing `/vN` major-version marker.
+    let mut last = pkg.rsplit('/').next().unwrap_or(pkg);
+    if last.starts_with('v') && last.len() > 1 && last[1..].chars().all(|c| c.is_ascii_digit()) {
+        let trimmed = &pkg[..pkg.len() - last.len() - 1];
+        last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    }
+    last.to_string()
 }
 
 // ----- gv tool {list, registry, remove} -------------------------------------

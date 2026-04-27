@@ -6,6 +6,32 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-27
+
+### Added
+
+- **GOPROXY honored** — `gv` reads `$GOPROXY` (with `direct` / `off` filtered)
+  and tries each entry in order. Mirrors how the Go runtime itself routes
+  module fetches. Required for users behind a private proxy
+  (`GOPROXY=https://goproxy.internal,https://proxy.golang.org`).
+- **GOSUMDB honored** — host portion of the env var is used for h1: hash
+  lookups; `GOSUMDB=off` errors out clearly so reproducibility isn't
+  silently bypassed.
+- **Semver constraints in `gv.toml`** — pin tools by range:
+  `gopls = "^v0.18"`, `golangci-lint = "~v1.64"`, `dlv = ">=v1.20,<v2"`.
+  `gv` walks the proxy's `/list` endpoint and picks the highest matching
+  release (pre-releases skipped).
+- **`gv outdated`** — read-only drift report. Prints `NAME / LOCKED /
+  LATEST / STATUS` for the toolchain plus every pinned tool, in parallel.
+  Exits 2 when anything is behind, so it slots straight into CI gating.
+- **`gv migrate-tools [--from FILE] [--dry-run]`** — discovers files with a
+  `//go:build tools` (or `// +build tools`) constraint, parses the blank
+  imports, resolves each to a Go module via the proxy, and pins them in
+  `gv.toml`. Migration helper for projects coming from the legacy
+  tools.go pattern.
+- **`gv completions <SHELL>`** — emits bash / zsh / fish / elvish /
+  PowerShell completions on stdout via clap_complete.
+
 ## [0.2.1] — 2026-04-27
 
 ### Added

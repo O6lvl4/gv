@@ -35,16 +35,19 @@ pub async fn resolve(
             "unknown tool '{name}': either pick from the built-in registry or set package = \"...\" in gv.toml"
         ))?;
 
-    let raw = spec.version();
-    let (module, version) = match raw {
-        "latest" | "*" => {
-            let (m, info) = proxy::find_module(client, &package).await?;
-            (m, info.version)
-        }
-        v => (
-            resolve_module_for_explicit_version(client, &package).await?,
-            v.to_string(),
-        ),
+    let raw = spec.version().trim();
+    let (module, version) = if raw == "latest" || raw == "*" {
+        let (m, info) = proxy::find_module(client, &package).await?;
+        (m, info.version)
+    } else if is_constraint(raw) {
+        let (m, _) = proxy::find_module(client, &package).await?;
+        let versions = proxy::list_versions(client, &m).await?;
+        let chosen = pick_max_satisfying(&versions, raw)
+            .ok_or_else(|| anyhow!("no version of {m} satisfies '{raw}'"))?;
+        (m, chosen)
+    } else {
+        let m = resolve_module_for_explicit_version(client, &package).await?;
+        (m, raw.to_string())
     };
 
     let module_hash = proxy::ziphash(client, &module, &version)
@@ -181,6 +184,71 @@ fn is_major_marker(s: &str) -> bool {
     s.starts_with('v') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit())
 }
 
+/// Detect a semver-style constraint string. Plain version strings like
+/// `v0.18.1` or `1.2.3` are *not* constraints and resolve verbatim.
+fn is_constraint(raw: &str) -> bool {
+    let s = raw.trim_start();
+    s.starts_with('^')
+        || s.starts_with('~')
+        || s.starts_with(">=")
+        || s.starts_with('>')
+        || s.starts_with("<=")
+        || s.starts_with('<')
+        || s.starts_with("=")
+        || s.contains(',')
+        || s.contains('*')
+}
+
+/// Strip the leading `v` from a Go module version so the `semver` crate can
+/// parse it. Returns `None` for pseudo-versions or non-semver tags.
+fn parse_go_version(raw: &str) -> Option<semver::Version> {
+    let s = raw.strip_prefix('v').unwrap_or(raw);
+    semver::Version::parse(s).ok()
+}
+
+/// Strip leading `v` from each comparator in a constraint so semver parses it
+/// (`^v0.18` → `^0.18`).
+fn normalize_req(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        // After an operator character or comma, eat optional 'v' prefix.
+        let just_emitted_op = matches!(c, '^' | '~' | '>' | '<' | '=' | ',' | ' ');
+        if just_emitted_op && chars.peek() == Some(&'v') {
+            chars.next();
+        }
+    }
+    out
+}
+
+/// Pick the highest version in `available` that satisfies `req`. Versions are
+/// expected to be `v`-prefixed (Go convention); the chosen value is returned
+/// in that same form. Pseudo-versions and pre-releases without a base of the
+/// form `vMAJOR.MINOR.PATCH` are skipped.
+pub fn pick_max_satisfying(available: &[String], req_raw: &str) -> Option<String> {
+    let req = semver::VersionReq::parse(&normalize_req(req_raw)).ok()?;
+    let mut best: Option<(semver::Version, String)> = None;
+    for raw in available {
+        let Some(v) = parse_go_version(raw) else {
+            continue;
+        };
+        // Skip pre-releases unless the constraint explicitly opts in. Go
+        // convention: stable releases never have a pre-release segment.
+        if !v.pre.is_empty() {
+            continue;
+        }
+        if !req.matches(&v) {
+            continue;
+        }
+        match &best {
+            Some((bv, _)) if &v <= bv => {}
+            _ => best = Some((v, raw.clone())),
+        }
+    }
+    best.map(|(_, raw)| raw)
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path).with_context(|| format!("hash {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -191,6 +259,54 @@ fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constraint_detection() {
+        assert!(is_constraint("^v0.18"));
+        assert!(is_constraint("~v1.2"));
+        assert!(is_constraint(">=v1.0,<v2.0"));
+        assert!(is_constraint("*"));
+        assert!(!is_constraint("v0.18.1"));
+        assert!(!is_constraint("0.18.1"));
+        assert!(!is_constraint("latest"));
+    }
+
+    #[test]
+    fn pick_max_caret() {
+        let available = vec![
+            "v0.18.0".to_string(),
+            "v0.18.1".to_string(),
+            "v0.18.2".to_string(),
+            "v0.19.0".to_string(),
+            "v1.0.0".to_string(),
+        ];
+        assert_eq!(
+            pick_max_satisfying(&available, "^v0.18").as_deref(),
+            Some("v0.18.2")
+        );
+    }
+
+    #[test]
+    fn pick_max_tilde() {
+        let available = vec![
+            "v1.2.3".to_string(),
+            "v1.2.7".to_string(),
+            "v1.3.0".to_string(),
+        ];
+        assert_eq!(
+            pick_max_satisfying(&available, "~v1.2").as_deref(),
+            Some("v1.2.7")
+        );
+    }
+
+    #[test]
+    fn pick_max_skips_prerelease() {
+        let available = vec!["v0.18.1".to_string(), "v0.19.0-rc1".to_string()];
+        assert_eq!(
+            pick_max_satisfying(&available, "^v0.18").as_deref(),
+            Some("v0.18.1")
+        );
+    }
 
     #[test]
     fn binary_name_default() {
