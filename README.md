@@ -39,14 +39,23 @@ Track [milestones](https://github.com/O6lvl4/gv/milestones).
 ## Install
 
 ```bash
-# install.sh — downloads the latest release for your platform
+# macOS / Linux — install.sh downloads the latest release for your platform
 curl -fsSL https://raw.githubusercontent.com/O6lvl4/gv/main/install.sh | sh
 
 # pin a version
-GV_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/O6lvl4/gv/main/install.sh | sh
+GV_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/O6lvl4/gv/main/install.sh | sh
 
 # from source
 cargo install --git https://github.com/O6lvl4/gv gv-cli
+```
+
+```powershell
+# Windows — install.ps1 mirrors install.sh in PowerShell
+iwr https://raw.githubusercontent.com/O6lvl4/gv/main/install.ps1 | iex
+
+# pin a version
+$env:GV_VERSION = "v0.2.0"
+iwr https://raw.githubusercontent.com/O6lvl4/gv/main/install.ps1 | iex
 ```
 
 After installing, optionally hook the toolchain shim:

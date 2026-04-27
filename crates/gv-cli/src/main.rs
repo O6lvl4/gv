@@ -103,6 +103,11 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Manage Go tools pinned in this project.
+    Tool {
+        #[command(subcommand)]
+        op: ToolCmd,
+    },
     /// Print the resolved environment as a tree.
     Tree,
     /// Re-resolve pinned tools (and optionally the toolchain) to their latest
@@ -133,6 +138,20 @@ enum CacheCmd {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ToolCmd {
+    /// List tools pinned in the current project.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Print the built-in tool registry (name → package).
+    Registry,
+    /// Pin a tool. Same as `gv add tool NAME[@VERSION]`.
+    Add { spec: String },
+    /// Remove a tool from gv.toml and gv.lock (binary stays in store
+    /// until `gv cache prune`).
+    Remove { name: String },
 }
 
 const STD_GO_TOOLS: &[&str] = &["go", "gofmt"];
@@ -183,6 +202,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Unlink { bin_dir, tools } => cmd_unlink(bin_dir, tools),
         Cmd::Init { with, go, force } => cmd_init(with, go, force).await,
         Cmd::SelfUpdate { check } => cmd_self_update(platform, check).await,
+        Cmd::Tool { op } => match op {
+            ToolCmd::List => cmd_tool_list(&paths),
+            ToolCmd::Registry => cmd_tool_registry(),
+            ToolCmd::Add { spec } => cmd_add_tool(&paths, &spec).await,
+            ToolCmd::Remove { name } => cmd_tool_remove(&paths, &name),
+        },
         Cmd::Tree => cmd_tree(&paths),
         Cmd::Upgrade { names, toolchain } => cmd_upgrade(&paths, platform, names, toolchain).await,
         Cmd::Cache { op } => match op {
@@ -791,7 +816,10 @@ async fn cmd_init(with: Option<Vec<String>>, go: Option<String>, force: bool) ->
             println!("      - {name} = \"{}\"", spec.version());
         }
     }
-    println!("{}", dim("    next      : run `gv sync` to install everything"));
+    println!(
+        "{}",
+        dim("    next      : run `gv sync` to install everything")
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -976,6 +1004,117 @@ fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
         std::fs::set_permissions(dest, perms)?;
     }
     Ok(())
+}
+
+// ----- gv tool {list, registry, remove} -------------------------------------
+
+fn cmd_tool_list(paths: &Paths) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let Some(root) = project::find_root(&cwd) else {
+        bail!("no project root found above {}", cwd.display());
+    };
+    let proj = project::load(&root)?;
+    let lock = Lock::load(&root)?;
+
+    if proj.tools.is_empty() {
+        println!("{}", dim("(no tools pinned in gv.toml)"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let name_w = proj.tools.keys().map(|s| s.len()).max().unwrap_or(0).max(4);
+    println!(
+        "{:<name_w$}  {:<12}  {:<10}  {}",
+        color_bold("NAME"),
+        color_bold("REQUESTED"),
+        color_bold("LOCKED"),
+        color_bold("STATUS"),
+        name_w = name_w
+    );
+    for (name, spec) in &proj.tools {
+        let requested = spec.version();
+        let (locked, status) = match lock.find_tool(name) {
+            Some(t) => {
+                let bin = tool::tool_bin_path(paths, t);
+                let installed = if bin.exists() {
+                    color_green("present")
+                } else {
+                    color_yellow("missing")
+                };
+                (t.version.clone(), installed)
+            }
+            None => ("—".to_string(), color_yellow("unsynced (run `gv sync`)")),
+        };
+        println!(
+            "{:<name_w$}  {:<12}  {:<10}  {}",
+            name,
+            requested,
+            locked,
+            status,
+            name_w = name_w
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_tool_registry() -> Result<ExitCode> {
+    let entries = gv_core::registry::all();
+    let name_w = entries
+        .iter()
+        .map(|e| e.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    println!(
+        "{:<name_w$}  {}",
+        color_bold("NAME"),
+        color_bold("PACKAGE"),
+        name_w = name_w
+    );
+    for e in entries {
+        println!("{:<name_w$}  {}", e.name, e.package, name_w = name_w);
+    }
+    println!();
+    println!(
+        "{}",
+        dim(&format!(
+            "    {} entries — pass `name@version` or set [tools.{{...}}] in gv.toml for a custom package",
+            entries.len()
+        ))
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_tool_remove(paths: &Paths, name: &str) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let Some(root) = project::find_root(&cwd) else {
+        bail!("no project root found above {}", cwd.display());
+    };
+
+    let mut proj = project::load(&root)?;
+    let mut lock = Lock::load(&root)?;
+    let in_proj = proj.tools.remove(name).is_some();
+    let in_lock_before = lock.tools.len();
+    lock.tools.retain(|t| t.name != name);
+    let in_lock = in_lock_before != lock.tools.len();
+
+    if !in_proj && !in_lock {
+        bail!("tool '{name}' is not pinned");
+    }
+
+    project::save(&root, &proj)?;
+    lock.save(&root)?;
+
+    println!(
+        "{} removed {} from project",
+        success_mark(),
+        color_bold(name)
+    );
+    let _ = paths; // binary lingers in the store until `gv cache prune`
+    println!(
+        "{}",
+        dim("    binary stays in the store; run `gv cache prune` to reclaim disk")
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 // ----- gv tree --------------------------------------------------------------

@@ -6,6 +6,21 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-04-27
+
+### Added
+
+- **`gv tool {list,ls,registry,add,remove}`** — first-class tool subcommand
+  group. `list` prints `NAME / REQUESTED / LOCKED / STATUS` from gv.toml
+  ⊕ gv.lock; `registry` lists the built-in name → package map; `remove`
+  drops a tool from gv.toml + gv.lock (binary lingers in the store until
+  `gv cache prune`). `gv add tool` keeps working as an alias.
+- **`install.ps1`** — PowerShell installer mirroring `install.sh` for
+  Windows users (downloads tar.gz, sha256-verifies, drops gv.exe into
+  `%LOCALAPPDATA%\gv\bin`).
+- **CI matrix grows windows-latest** so fmt + clippy + build + test run
+  on every push for all three target families.
+
 ## [0.2.0] — 2026-04-27
 
 ### Added
