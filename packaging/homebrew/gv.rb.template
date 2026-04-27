@@ -1,40 +1,37 @@
-# Homebrew formula template for gv. Lives in the user's tap repo at
-# `O6lvl4/homebrew-tap/Formula/gv.rb`. The release workflow can publish a
-# concrete copy with the placeholders below filled in.
-
 class Gv < Formula
-  desc "Go version & toolchain manager. uv-grade speed."
+  desc "Go version and toolchain manager — uv-grade speed"
   homepage "https://github.com/O6lvl4/gv"
-  version "{{VERSION}}"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/O6lvl4/gv/releases/download/v#{version}/gv-v#{version}-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/O6lvl4/gv/releases/download/v{{VERSION}}/gv-v{{VERSION}}-aarch64-apple-darwin.tar.gz"
       sha256 "{{SHA_DARWIN_ARM64}}"
     end
     on_intel do
-      url "https://github.com/O6lvl4/gv/releases/download/v#{version}/gv-v#{version}-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/O6lvl4/gv/releases/download/v{{VERSION}}/gv-v{{VERSION}}-x86_64-apple-darwin.tar.gz"
       sha256 "{{SHA_DARWIN_X86_64}}"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/O6lvl4/gv/releases/download/v#{version}/gv-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+      url "https://github.com/O6lvl4/gv/releases/download/v{{VERSION}}/gv-v{{VERSION}}-aarch64-unknown-linux-musl.tar.gz"
       sha256 "{{SHA_LINUX_ARM64}}"
     end
     on_intel do
-      url "https://github.com/O6lvl4/gv/releases/download/v#{version}/gv-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+      url "https://github.com/O6lvl4/gv/releases/download/v{{VERSION}}/gv-v{{VERSION}}-x86_64-unknown-linux-musl.tar.gz"
       sha256 "{{SHA_LINUX_X86_64}}"
     end
   end
 
   def install
-    bin.install "gv", "gv-shim"
+    bin.install "gv"
+    bin.install "gv-shim"
   end
 
   test do
     assert_match "gv", shell_output("#{bin}/gv --version")
+    assert_match "Go version", shell_output("#{bin}/gv --help")
   end
 end

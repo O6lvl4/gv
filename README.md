@@ -59,8 +59,22 @@ gv link --tools go,gofmt,godoc
 This makes `go build` etc. dispatch through `gv-shim`, which honors
 `go.mod`'s `toolchain` line and `.go-version` automatically.
 
-A Homebrew tap is planned. The formula template lives at
-[`packaging/homebrew/gv.rb.template`](packaging/homebrew/gv.rb.template).
+### Homebrew
+
+```bash
+brew install O6lvl4/tap/gv
+```
+
+The tap lives at [O6lvl4/homebrew-tap](https://github.com/O6lvl4/homebrew-tap)
+and is bumped automatically on every stable release by the `bump-tap` job in
+`.github/workflows/release.yml` (driven by the
+[`packaging/homebrew/gv.rb.template`](packaging/homebrew/gv.rb.template)
+template). Pre-release tags (those containing `-`, e.g. `v0.2.0-rc1`) skip the
+bump.
+
+> **Maintainer note**: the bump job needs a repo secret `TAP_TOKEN` on
+> `O6lvl4/gv` containing a fine-grained PAT with `Contents: read+write` on
+> `O6lvl4/homebrew-tap`.
 
 ## Quickstart
 
