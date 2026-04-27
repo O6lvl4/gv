@@ -6,6 +6,45 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-04-27
+
+uv parity sprint: `gvx`, `gv tree --deps`, global `--quiet`, `gv uninstall`,
+`gv lock`, `gv dir`.
+
+### Added
+
+- **`gvx <tool> [args…]`** — uv's killer ephemeral-run feature, ported.
+  Resolves `<tool>` against the registry (or accepts a full
+  `package@version`), builds it into the same content-addressed
+  per-tool store, then `exec`s without ever touching `gv.toml` or
+  `gv.lock`. Reuses already-installed copies. Toolchain priority:
+  project's resolved Go → latest installed → install latest stable.
+  Hooked up via argv[0] dispatch — install scripts now drop a `gvx`
+  symlink (Unix) / copy (Windows) next to `gv`.
+- **`gv tree --deps`** — extends the resolved-environment tree with each
+  module's direct `require` lines (skipping `// indirect`). In a
+  workspace, every member's `go.mod` is rendered as its own branch.
+- **Global `-q` / `--quiet`** — suppresses spinners, status banners, and
+  the `Resolved/Built` summary lines while preserving real errors and
+  the per-tool `+ / ~ / =` diff. Honored by `sync`, `add tool`,
+  `upgrade`, `gvx`, and lock-aware commands.
+- **`gv uninstall <version>`** — symmetric counterpart to `gv install`;
+  drops the `versions/<v>` link. Store dir lingers for `gv cache prune`
+  to reclaim, so co-installed projects aren't surprised.
+- **`gv lock`** — re-resolves every entry in `gv.toml` against
+  GOPROXY/sumdb and rewrites `gv.lock` *without* running `go install`.
+  Use case: bumping a constraint and committing the lock from a
+  build-cold machine.
+- **`gv dir <kind>`** — one-line path query for shell substitution
+  (`cd "$(gv dir tools)"`). Kinds: `data`, `cache`, `config`, `store`,
+  `versions`, `tools`.
+
+### Distribution
+
+- `install.sh` and `install.ps1` now create a `gvx` shim alongside `gv`.
+- The Homebrew formula template adds `bin.install_symlink "gv" => "gvx"`
+  so the next stable tag's auto-bump ships `gvx` system-wide.
+
 ## [0.4.0] — 2026-04-27
 
 ### Added

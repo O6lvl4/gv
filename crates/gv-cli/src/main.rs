@@ -23,6 +23,10 @@ use sha2::Digest;
     propagate_version = true
 )]
 struct Cli {
+    /// Suppress non-essential output (spinners, summaries, hints).
+    /// Real errors and explicit query results still print.
+    #[arg(short = 'q', long = "quiet", global = true)]
+    quiet: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -108,8 +112,26 @@ enum Cmd {
         #[command(subcommand)]
         op: ToolCmd,
     },
-    /// Print the resolved environment as a tree.
-    Tree,
+    /// Run a tool ephemerally without pinning it in gv.toml. Resolves and
+    /// installs (or reuses a cached install), then execs. Same backing
+    /// content-addressed store as `gv tool add`, just no project state
+    /// touched. The `gvx` shim dispatches into this command.
+    X {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        argv: Vec<String>,
+    },
+    /// Remove a Go toolchain (drops the versions/<v> link; the store dir
+    /// is reclaimed by `gv cache prune`).
+    Uninstall { version: String },
+    /// Re-resolve gv.toml against the proxy and rewrite gv.lock without
+    /// installing anything.
+    Lock,
+    /// Print resolved environment as a tree.
+    Tree {
+        /// Also list direct go.mod dependencies.
+        #[arg(long)]
+        deps: bool,
+    },
     /// Re-resolve pinned tools (and optionally the toolchain) to their latest
     /// matching versions. Updates gv.lock and re-installs anything that moved.
     Upgrade {
@@ -151,8 +173,30 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Print the path of a gv-managed directory (for shell substitution,
+    /// e.g. `cd "$(gv dir tools)"`).
+    Dir {
+        #[arg(value_enum)]
+        kind: DirKind,
+    },
     /// Health check.
     Doctor,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum DirKind {
+    /// Top-level data directory (`~/.local/share/gv`).
+    Data,
+    /// Cache directory.
+    Cache,
+    /// Config directory.
+    Config,
+    /// Content-addressed toolchain store.
+    Store,
+    /// Toolchain symlink farm.
+    Versions,
+    /// Per-tool store (`~/.local/share/gv/tools`).
+    Tools,
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,8 +243,43 @@ enum AddCmd {
     Tool { spec: String },
 }
 
+/// Global verbosity gate. Set once from `--quiet`; helpers consult it.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `say!` works like `println!` but stays silent under `--quiet`.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        if !quiet() {
+            println!($($arg)*);
+        }
+    }};
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // argv[0]-based dispatch: when the binary is invoked as `gvx` (symlink or
+    // copy), inject `x` as the first positional so users don't have to type
+    // `gv x …`. Mirrors uv's `uvx` shim.
+    let argv0_basename = std::env::args_os()
+        .next()
+        .and_then(|p| {
+            Path::new(&p)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let cli = if argv0_basename == "gvx" {
+        let injected = std::iter::once("gv".to_string())
+            .chain(std::iter::once("x".to_string()))
+            .chain(std::env::args().skip(1));
+        Cli::parse_from(injected)
+    } else {
+        Cli::parse()
+    };
+    QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -245,12 +324,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             ToolCmd::Add { spec } => cmd_add_tool(&paths, &spec).await,
             ToolCmd::Remove { name } => cmd_tool_remove(&paths, &name),
         },
-        Cmd::Tree => cmd_tree(&paths),
+        Cmd::X { argv } => cmd_x(&paths, argv).await,
+        Cmd::Uninstall { version } => cmd_uninstall(&paths, &version),
+        Cmd::Lock => cmd_lock(&paths).await,
+        Cmd::Tree { deps } => cmd_tree(&paths, deps),
         Cmd::Upgrade { names, toolchain } => cmd_upgrade(&paths, platform, names, toolchain).await,
         Cmd::Cache { op } => match op {
             CacheCmd::Info => cmd_cache_info(&paths),
             CacheCmd::Prune { dry_run, go_cache } => cmd_cache_prune(&paths, dry_run, go_cache),
         },
+        Cmd::Dir { kind } => cmd_dir(&paths, kind),
         Cmd::Outdated => cmd_outdated(&paths, platform).await,
         Cmd::Env { shell } => cmd_env(&paths, shell),
         Cmd::MigrateTools { from, dry_run } => cmd_migrate_tools(from, dry_run).await,
@@ -671,7 +754,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         let recovered = target
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
             .unwrap_or_default();
-        println!(
+        say!(
             "{} {go_version} {}",
             success_mark(),
             dim("(already present)")
@@ -725,7 +808,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
     });
     let resolved: Vec<tool::ResolvedTool> = try_join_all(resolve_futs).await?;
     let resolve_ms = resolve_started.elapsed().as_millis();
-    println!(
+    say!(
         "{} Resolved {} tool{} in {}",
         success_mark(),
         resolved.len(),
@@ -767,7 +850,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
     }
     summary.sort();
 
-    println!(
+    say!(
         "{} Built {} tool{} in {}",
         success_mark(),
         summary.len(),
@@ -1450,7 +1533,7 @@ fn cmd_tool_remove(paths: &Paths, name: &str) -> Result<ExitCode> {
 
 // ----- gv tree --------------------------------------------------------------
 
-fn cmd_tree(paths: &Paths) -> Result<ExitCode> {
+fn cmd_tree(paths: &Paths, deps: bool) -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
     let root = project::find_root(&cwd);
 
@@ -1528,6 +1611,310 @@ fn cmd_tree(paths: &Paths) -> Result<ExitCode> {
             println!("    {indent}└── bin     : {}", bin.display());
         }
     }
+
+    if deps {
+        if let Some(r) = root.as_deref() {
+            println!();
+            println!("{}", color_bold("dependencies"));
+            let go_mods = collect_go_mods(r);
+            if go_mods.is_empty() {
+                println!("  {}", dim("(no go.mod found)"));
+            } else {
+                for (i, gm) in go_mods.iter().enumerate() {
+                    let last = i == go_mods.len() - 1;
+                    let branch = if last { "└──" } else { "├──" };
+                    let sub_indent = if last { "    " } else { "│   " };
+                    println!(
+                        "{branch} {} ({})",
+                        color_cyan(&display_path(gm.parent().unwrap_or(gm))),
+                        dim(&format!("{}", gm.display()))
+                    );
+                    let direct = parse_go_mod_direct_deps(gm).unwrap_or_default();
+                    if direct.is_empty() {
+                        println!("{sub_indent}└── {}", dim("(no direct dependencies)"));
+                    } else {
+                        let last_idx = direct.len() - 1;
+                        for (j, dep) in direct.iter().enumerate() {
+                            let mark = if j == last_idx {
+                                "└──"
+                            } else {
+                                "├──"
+                            };
+                            println!("{sub_indent}{mark} {} {}", dep.0, dim(&dep.1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn collect_go_mods(root: &Path) -> Vec<PathBuf> {
+    // If go.work is present, collect every member's go.mod. Otherwise just
+    // the top-level go.mod (if any).
+    let go_work = root.join(gv_core::workspace::WORKSPACE_FILE);
+    if go_work.is_file() {
+        if let Ok(work) = gv_core::workspace::load(root) {
+            let mut out = Vec::new();
+            for m in &work.members {
+                let candidate = m.join("go.mod");
+                if candidate.is_file() {
+                    out.push(candidate);
+                }
+            }
+            return out;
+        }
+    }
+    let go_mod = root.join("go.mod");
+    if go_mod.is_file() {
+        vec![go_mod]
+    } else {
+        vec![]
+    }
+}
+
+/// Parse direct (non-`// indirect`) `require` lines from a go.mod file.
+/// Returns `(module_path, version)` pairs.
+fn parse_go_mod_direct_deps(go_mod: &Path) -> Result<Vec<(String, String)>> {
+    let text =
+        std::fs::read_to_string(go_mod).with_context(|| format!("read {}", go_mod.display()))?;
+    let mut out = Vec::new();
+    let mut in_require_block = false;
+    for raw in text.lines() {
+        let stripped_comment = match raw.split_once("//") {
+            Some((_, after)) if after.trim() == "indirect" => continue,
+            Some((before, _)) => before,
+            None => raw,
+        };
+        let line = stripped_comment.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "require (" {
+            in_require_block = true;
+            continue;
+        }
+        if in_require_block && line == ")" {
+            in_require_block = false;
+            continue;
+        }
+        let item = if let Some(rest) = line.strip_prefix("require ") {
+            rest.trim()
+        } else if in_require_block {
+            line
+        } else {
+            continue;
+        };
+        // Split on whitespace into (path, version)
+        let mut parts = item.split_whitespace();
+        let (Some(path), Some(version)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        out.push((path.to_string(), version.to_string()));
+    }
+    out.sort();
+    Ok(out)
+}
+
+// ----- gv x (ephemeral) ----------------------------------------------------
+
+async fn cmd_x(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
+    if argv.is_empty() {
+        bail!("usage: gvx <tool> [args...]   (e.g. `gvx staticcheck ./...`)");
+    }
+    let (spec, rest) = (&argv[0], &argv[1..]);
+    let (name, version) = parse_tool_spec(spec);
+    let spec_obj = ToolSpec::Short(version.unwrap_or_else(|| "latest".to_string()));
+
+    let client = http_client()?;
+    let pb = spinner(&format!("resolving {name}"));
+    let resolved = tool::resolve(&client, &name, &spec_obj).await?;
+    pb.finish_and_clear();
+
+    // Pick a Go toolchain. Prefer the project's (so workspace tools build
+    // against the same Go), otherwise the latest installed, otherwise install
+    // the latest stable.
+    let cwd = std::env::current_dir()?;
+    let go_version = match resolve::resolve(paths, &cwd)? {
+        Some(r) => r.version,
+        None => {
+            // Fall back: if a toolchain is already installed, use that.
+            // Otherwise install the latest stable.
+            let installed = resolve::list_installed(paths)?;
+            if let Some(v) = installed.into_iter().next() {
+                v
+            } else {
+                let releases = release::fetch_index(&client).await?;
+                let latest = release::latest_stable(&releases)
+                    .ok_or_else(|| anyhow!("no stable Go release found"))?;
+                let installer = Installer {
+                    paths,
+                    client: &client,
+                    platform: Platform::detect()?,
+                };
+                let pb = spinner(&format!("installing {} for ephemeral run", latest.version));
+                let report = installer.install(&latest.version).await?;
+                pb.finish_and_clear();
+                report.version
+            }
+        }
+    };
+
+    let bin_path = tool::tool_dir(paths, &resolved.name, &resolved.version).join(&resolved.bin);
+
+    if !bin_path.exists() {
+        let pb = spinner(&format!("building {}@{}", resolved.name, resolved.version));
+        let resolved_clone = resolved.clone();
+        let paths_clone = paths.clone();
+        let go_version_clone = go_version.clone();
+        let _locked = tokio::task::spawn_blocking(move || {
+            tool::install(&paths_clone, &go_version_clone, &resolved_clone)
+        })
+        .await
+        .map_err(|e| anyhow!("install task panicked: {e}"))??;
+        pb.finish_and_clear();
+        say!(
+            "{} {} {}@{}",
+            success_mark(),
+            dim("ephemeral:"),
+            resolved.name,
+            resolved.version
+        );
+    }
+
+    use std::process::Command;
+    let mut child = Command::new(&bin_path);
+    child.args(rest);
+    let bin_dir = paths.version_dir(&go_version).join("bin");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut new_path = std::ffi::OsString::from(bin_dir.as_os_str());
+    new_path.push(":");
+    new_path.push(&path);
+    child.env("PATH", new_path);
+    child.env("GOROOT", paths.version_dir(&go_version));
+    child.env("GOTOOLCHAIN", "local");
+    let status = child
+        .status()
+        .with_context(|| format!("spawn {}", bin_path.display()))?;
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+// ----- gv uninstall ---------------------------------------------------------
+
+fn cmd_uninstall(paths: &Paths, version: &str) -> Result<ExitCode> {
+    let canonical = release::normalize_version(version);
+    let link = paths.version_dir(&canonical);
+    if !link.exists() && !link.is_symlink() {
+        bail!("{canonical} is not installed");
+    }
+    std::fs::remove_file(&link)
+        .or_else(|_| std::fs::remove_dir_all(&link))
+        .with_context(|| format!("remove {}", link.display()))?;
+    println!("{} uninstalled {canonical}", success_mark());
+    say!(
+        "{}",
+        dim("    note: store dir kept; reclaim disk with `gv cache prune`")
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+// ----- gv lock --------------------------------------------------------------
+
+async fn cmd_lock(paths: &Paths) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let root = project::find_root(&cwd).ok_or_else(|| {
+        anyhow!(
+            "no project root found (need a go.mod or gv.toml above {})",
+            cwd.display()
+        )
+    })?;
+    let proj = project::load(&root)?;
+    let mut lock = Lock::load(&root)?;
+    let client = http_client()?;
+
+    // Toolchain
+    let go_version = match resolve::resolve(paths, &root)? {
+        Some(r) => r.version,
+        None => proj
+            .go
+            .as_ref()
+            .map(|g| release::normalize_version(&g.version))
+            .ok_or_else(|| anyhow!("no Go version is resolvable here"))?,
+    };
+    // We don't need to install to compute go-archive sha; reach into the
+    // release index for that.
+    let releases = release::fetch_index(&client).await?;
+    let platform = Platform::detect()?;
+    let go_sha256 = match release::select_archive(&releases, &go_version, platform) {
+        Ok((_, file)) => file.sha256.clone(),
+        Err(_) => String::new(),
+    };
+    lock.go = Some(gv_core::lock::LockedGo {
+        version: go_version.clone(),
+        sha256: go_sha256,
+    });
+
+    if !proj.tools.is_empty() {
+        let pb = spinner(&format!("re-resolving {} tool(s)", proj.tools.len()));
+        let futs = proj.tools.iter().map(|(name, spec)| {
+            let client = client.clone();
+            let name = name.clone();
+            let spec = spec.clone();
+            async move { tool::resolve(&client, &name, &spec).await }
+        });
+        let resolved: Vec<tool::ResolvedTool> = try_join_all(futs).await?;
+        pb.finish_and_clear();
+        for r in resolved {
+            // Carry over built_with / binary_sha256 from the existing lock entry
+            // when version matches; otherwise leave them empty (they'll fill
+            // in on the next sync).
+            let prev = lock.find_tool(&r.name);
+            let built_with = prev
+                .filter(|p| p.version == r.version)
+                .map(|p| p.built_with.clone())
+                .unwrap_or_default();
+            let binary_sha256 = prev
+                .filter(|p| p.version == r.version)
+                .map(|p| p.binary_sha256.clone())
+                .unwrap_or_default();
+            lock.upsert_tool(LockedTool {
+                name: r.name,
+                package: r.package,
+                version: r.version,
+                bin: r.bin,
+                module_hash: r.module_hash,
+                built_with,
+                binary_sha256,
+            });
+        }
+    }
+
+    lock.save(&root)?;
+    println!(
+        "{} wrote {}",
+        success_mark(),
+        root.join("gv.lock").display()
+    );
+    say!(
+        "{}",
+        dim("    note: nothing was installed; run `gv sync` to materialize")
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+// ----- gv dir ---------------------------------------------------------------
+
+fn cmd_dir(paths: &Paths, kind: DirKind) -> Result<ExitCode> {
+    let p = match kind {
+        DirKind::Data => paths.data.clone(),
+        DirKind::Cache => paths.cache.clone(),
+        DirKind::Config => paths.config.clone(),
+        DirKind::Store => paths.store(),
+        DirKind::Versions => paths.versions(),
+        DirKind::Tools => paths.data.join("tools"),
+    };
+    println!("{}", p.display());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1986,6 +2373,9 @@ fn color_bold(s: &str) -> String {
 // ----- presentation helpers --------------------------------------------------
 
 fn spinner(msg: &str) -> ProgressBar {
+    if quiet() {
+        return ProgressBar::hidden();
+    }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("  {spinner:.green} {msg}")

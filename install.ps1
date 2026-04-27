@@ -89,6 +89,9 @@ try {
     }
     Copy-Item -Force (Join-Path $stage "gv.exe")      (Join-Path $InstallDir "gv.exe")
     Copy-Item -Force (Join-Path $stage "gv-shim.exe") (Join-Path $InstallDir "gv-shim.exe")
+    # Windows lacks reliable user-level symlinks; copy to gvx.exe instead.
+    # argv[0]-stem dispatch in the gv binary rewrites `gvx …` → `gv x …`.
+    Copy-Item -Force (Join-Path $InstallDir "gv.exe") (Join-Path $InstallDir "gvx.exe")
 
     Say "installed to $InstallDir"
     & (Join-Path $InstallDir "gv.exe") --version

@@ -28,6 +28,8 @@ class Gv < Formula
   def install
     bin.install "gv"
     bin.install "gv-shim"
+    # gvx is argv[0]-dispatched into `gv x …`; ship as a symlink in the prefix.
+    bin.install_symlink "gv" => "gvx"
   end
 
   test do

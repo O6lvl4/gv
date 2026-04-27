@@ -88,6 +88,10 @@ main() {
   install -m 0755 "${stage}/gv"      "${INSTALL_DIR}/gv"
   install -m 0755 "${stage}/gv-shim" "${INSTALL_DIR}/gv-shim"
 
+  # Create the `gvx` ephemeral-run shim. argv[0] dispatch in the gv binary
+  # rewrites `gvx <tool> [args]` to `gv x <tool> [args]`.
+  ln -sfn gv "${INSTALL_DIR}/gvx"
+
   say "installed to ${INSTALL_DIR}"
   say "  gv      = $(${INSTALL_DIR}/gv --version 2>/dev/null || echo 'not on PATH yet')"
 
