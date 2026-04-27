@@ -20,31 +20,38 @@ pub struct Lock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockedGo {
-    pub version: String,        // "go1.25.0"
-    pub sha256: String,         // archive sha256 (matches release index)
+    pub version: String, // "go1.25.0"
+    pub sha256: String,  // archive sha256 (matches release index)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockedTool {
-    pub name: String,           // user-facing short name, e.g. "gopls"
-    pub package: String,        // full Go package path
-    pub version: String,        // resolved semver, e.g. "v0.18.1"
-    pub bin: String,            // installed binary name
-    pub module_hash: String,    // h1:... from proxy.golang.org/.../@v/<v>.ziphash
-    pub built_with: String,     // Go toolchain that produced the binary
-    pub binary_sha256: String,  // recorded after install (informational)
+    pub name: String,          // user-facing short name, e.g. "gopls"
+    pub package: String,       // full Go package path
+    pub version: String,       // resolved semver, e.g. "v0.18.1"
+    pub bin: String,           // installed binary name
+    pub module_hash: String,   // h1:... from proxy.golang.org/.../@v/<v>.ziphash
+    pub built_with: String,    // Go toolchain that produced the binary
+    pub binary_sha256: String, // recorded after install (informational)
 }
 
 impl Lock {
-    pub fn empty() -> Self { Self { version: LOCK_VERSION, ..Default::default() } }
+    pub fn empty() -> Self {
+        Self {
+            version: LOCK_VERSION,
+            ..Default::default()
+        }
+    }
 
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(LOCK_FILE);
-        if !path.is_file() { return Ok(Self::empty()); }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let lock: Lock = toml::from_str(&raw)
-            .with_context(|| format!("parse {}", path.display()))?;
+        if !path.is_file() {
+            return Ok(Self::empty());
+        }
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let lock: Lock =
+            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         Ok(lock)
     }
 
@@ -52,8 +59,7 @@ impl Lock {
         let path = root.join(LOCK_FILE);
         let text = toml::to_string_pretty(self)
             .with_context(|| format!("serialize {}", path.display()))?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
 

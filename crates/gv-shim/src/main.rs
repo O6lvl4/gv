@@ -16,7 +16,9 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> Result<(), String> {
-    let argv0 = std::env::args_os().next().ok_or_else(|| "missing argv[0]".to_string())?;
+    let argv0 = std::env::args_os()
+        .next()
+        .ok_or_else(|| "missing argv[0]".to_string())?;
     let argv0_path = PathBuf::from(&argv0);
     let tool_name = argv0_path
         .file_name()
@@ -29,7 +31,10 @@ fn try_main() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no Go version resolved".to_string())?;
 
-    let bin = paths.version_dir(&resolved.version).join("bin").join(&tool_name);
+    let bin = paths
+        .version_dir(&resolved.version)
+        .join("bin")
+        .join(&tool_name);
     if !bin.exists() {
         return Err(format!(
             "{} not found at {} — run `gv install {}`",
@@ -49,7 +54,7 @@ fn try_main() -> Result<(), String> {
         cmd.env("GOROOT", paths.version_dir(&resolved.version));
         cmd.env("GOTOOLCHAIN", "local");
         let err = cmd.exec();
-        return Err(format!("execve failed: {err}"));
+        Err(format!("execve failed: {err}"))
     }
 
     #[cfg(not(unix))]

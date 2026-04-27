@@ -7,9 +7,9 @@ use directories::ProjectDirs;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
-    pub data: PathBuf,    // ~/.local/share/gv
-    pub config: PathBuf,  // ~/.config/gv
-    pub cache: PathBuf,   // ~/.cache/gv
+    pub data: PathBuf,   // ~/.local/share/gv
+    pub config: PathBuf, // ~/.config/gv
+    pub cache: PathBuf,  // ~/.cache/gv
 }
 
 impl Paths {
@@ -52,7 +52,14 @@ impl Paths {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
-        for d in [&self.data, &self.config, &self.cache, &self.store(), &self.versions(), &self.bin()] {
+        for d in [
+            &self.data,
+            &self.config,
+            &self.cache,
+            &self.store(),
+            &self.versions(),
+            &self.bin(),
+        ] {
             ensure_dir(d)?;
         }
         Ok(())

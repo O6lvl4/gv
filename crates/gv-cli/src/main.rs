@@ -16,7 +16,7 @@ use gv_core::{release, resolve, tool};
     name = "gv",
     version,
     about = "Go version & toolchain manager. uv-grade speed.",
-    propagate_version = true,
+    propagate_version = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -26,9 +26,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Install a Go toolchain (e.g. `gv install 1.25.0`, `gv install latest`).
-    Install {
-        version: String,
-    },
+    Install { version: String },
     /// List installed toolchains, or remote ones with --remote.
     List {
         #[arg(long)]
@@ -42,9 +40,7 @@ enum Cmd {
         tool: String,
     },
     /// Set the global default version (writes to `~/.config/gv/global`).
-    UseGlobal {
-        version: String,
-    },
+    UseGlobal { version: String },
     /// Run a command using the resolved toolchain (or a pinned tool).
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -62,16 +58,38 @@ enum Cmd {
         #[arg(long)]
         frozen: bool,
     },
+    /// Install symlinks so `go`, `gofmt`, etc. dispatch through gv-shim.
+    Link {
+        /// Where to create the symlinks (defaults to ~/.local/bin).
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        /// Path to the gv-shim binary (defaults to alongside `gv`).
+        #[arg(long)]
+        shim: Option<PathBuf>,
+        /// Tool names to link. Defaults to the standard Go toolchain set.
+        #[arg(long, value_delimiter = ',')]
+        tools: Option<Vec<String>>,
+        /// Replace existing files even if they aren't symlinks.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove symlinks created by `gv link`.
+    Unlink {
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        #[arg(long, value_delimiter = ',')]
+        tools: Option<Vec<String>>,
+    },
     /// Health check.
     Doctor,
 }
 
+const STD_GO_TOOLS: &[&str] = &["go", "gofmt"];
+
 #[derive(Debug, Subcommand)]
 enum AddCmd {
     /// Pin a tool. Use `name` (registry lookup) or `name@version`.
-    Tool {
-        spec: String,
-    },
+    Tool { spec: String },
 }
 
 fn main() -> ExitCode {
@@ -105,8 +123,130 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             AddCmd::Tool { spec } => cmd_add_tool(&paths, &spec).await,
         },
         Cmd::Sync { frozen } => cmd_sync(&paths, platform, frozen).await,
+        Cmd::Link {
+            bin_dir,
+            shim,
+            tools,
+            force,
+        } => cmd_link(bin_dir, shim, tools, force),
+        Cmd::Unlink { bin_dir, tools } => cmd_unlink(bin_dir, tools),
         Cmd::Doctor => cmd_doctor(&paths, platform),
     }
+}
+
+fn default_bin_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".local").join("bin"))
+}
+
+fn default_shim_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("locate gv binary")?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("gv binary has no parent dir"))?;
+    let shim = dir.join("gv-shim");
+    if !shim.exists() {
+        bail!(
+            "gv-shim not found next to gv ({}). Pass --shim explicitly.",
+            shim.display()
+        );
+    }
+    Ok(shim)
+}
+
+fn cmd_link(
+    bin_dir: Option<PathBuf>,
+    shim: Option<PathBuf>,
+    tools: Option<Vec<String>>,
+    force: bool,
+) -> Result<ExitCode> {
+    let bin_dir = bin_dir.map(Result::Ok).unwrap_or_else(default_bin_dir)?;
+    let shim = shim.map(Result::Ok).unwrap_or_else(default_shim_path)?;
+    let tools: Vec<String> =
+        tools.unwrap_or_else(|| STD_GO_TOOLS.iter().map(|s| s.to_string()).collect());
+
+    if !shim.exists() {
+        bail!("shim binary not found at {}", shim.display());
+    }
+    std::fs::create_dir_all(&bin_dir).with_context(|| format!("create {}", bin_dir.display()))?;
+
+    for name in &tools {
+        let dest = bin_dir.join(name);
+        if dest.exists() || dest.is_symlink() {
+            if !force {
+                let is_our_link = std::fs::read_link(&dest)
+                    .map(|p| p == shim)
+                    .unwrap_or(false);
+                if is_our_link {
+                    println!("✓ {name} already links to gv-shim");
+                    continue;
+                } else {
+                    println!(
+                        "! {name} exists at {} and is not our shim — skipping (use --force)",
+                        dest.display()
+                    );
+                    continue;
+                }
+            }
+            std::fs::remove_file(&dest).ok();
+        }
+        symlink(&shim, &dest)
+            .with_context(|| format!("link {} -> {}", dest.display(), shim.display()))?;
+        println!("✓ linked {name} → gv-shim");
+    }
+
+    if !path_contains(&bin_dir) {
+        println!();
+        println!(
+            "note: {} is not on $PATH. Add this to your shell rc:",
+            bin_dir.display()
+        );
+        println!("  export PATH=\"{}:$PATH\"", bin_dir.display());
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_unlink(bin_dir: Option<PathBuf>, tools: Option<Vec<String>>) -> Result<ExitCode> {
+    let bin_dir = bin_dir.map(Result::Ok).unwrap_or_else(default_bin_dir)?;
+    let tools: Vec<String> =
+        tools.unwrap_or_else(|| STD_GO_TOOLS.iter().map(|s| s.to_string()).collect());
+
+    for name in &tools {
+        let dest = bin_dir.join(name);
+        if !dest.exists() && !dest.is_symlink() {
+            continue;
+        }
+        // Only remove if it's a symlink (don't blow away a real binary by accident).
+        if dest.is_symlink() {
+            std::fs::remove_file(&dest).with_context(|| format!("remove {}", dest.display()))?;
+            println!("✓ unlinked {name}");
+        } else {
+            println!(
+                "! {name} at {} is a real file (not a symlink) — leaving it",
+                dest.display()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+fn path_contains(dir: &Path) -> bool {
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    std::env::split_paths(&path).any(|p| p == dir)
 }
 
 async fn cmd_install(paths: &Paths, platform: Platform, version: &str) -> Result<ExitCode> {
@@ -123,16 +263,27 @@ async fn cmd_install(paths: &Paths, platform: Platform, version: &str) -> Result
     };
 
     println!("→ installing {resolved} for {}", platform.release_suffix());
-    let installer = Installer { paths, client: &client, platform };
+    let installer = Installer {
+        paths,
+        client: &client,
+        platform,
+    };
     let report = installer.install(&resolved).await?;
 
     if report.already_present {
-        println!("✓ {} already in store ({})", report.version, &report.sha256[..12]);
+        println!(
+            "✓ {} already in store ({})",
+            report.version,
+            &report.sha256[..12]
+        );
     } else {
         println!("✓ installed {} ({})", report.version, &report.sha256[..12]);
     }
     println!("  → {}", report.install_dir.display());
-    println!("  → linked: {}", paths.version_dir(&report.version).display());
+    println!(
+        "  → linked: {}",
+        paths.version_dir(&report.version).display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -231,7 +382,11 @@ fn cmd_run(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
         (Some(p), Some(r)) => (p, paths.version_dir(&r.version)),
         (None, Some(r)) => {
             let toolchain_bin = paths.version_dir(&r.version).join("bin").join(cmd);
-            let exe = if toolchain_bin.exists() { toolchain_bin } else { PathBuf::from(cmd) };
+            let exe = if toolchain_bin.exists() {
+                toolchain_bin
+            } else {
+                PathBuf::from(cmd)
+            };
             (exe, paths.version_dir(&r.version))
         }
         (Some(p), None) => (p, PathBuf::new()),
@@ -260,14 +415,20 @@ fn cmd_run(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
     }
     child.env("GOTOOLCHAIN", "local");
 
-    let status = child.status().with_context(|| format!("spawn {}", exe.display()))?;
+    let status = child
+        .status()
+        .with_context(|| format!("spawn {}", exe.display()))?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
 async fn cmd_add_tool(paths: &Paths, spec: &str) -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
-    let root = project::find_root(&cwd)
-        .ok_or_else(|| anyhow!("no project root found (need a go.mod or gv.toml above {})", cwd.display()))?;
+    let root = project::find_root(&cwd).ok_or_else(|| {
+        anyhow!(
+            "no project root found (need a go.mod or gv.toml above {})",
+            cwd.display()
+        )
+    })?;
 
     let (name, version) = parse_tool_spec(spec);
     let mut proj = project::load(&root)?;
@@ -284,8 +445,12 @@ async fn cmd_add_tool(paths: &Paths, spec: &str) -> Result<ExitCode> {
 
 async fn cmd_sync(paths: &Paths, _platform: Platform, frozen: bool) -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
-    let root = project::find_root(&cwd)
-        .ok_or_else(|| anyhow!("no project root found (need a go.mod or gv.toml above {})", cwd.display()))?;
+    let root = project::find_root(&cwd).ok_or_else(|| {
+        anyhow!(
+            "no project root found (need a go.mod or gv.toml above {})",
+            cwd.display()
+        )
+    })?;
     sync_project(paths, &root, frozen).await?;
     Ok(ExitCode::SUCCESS)
 }
@@ -310,7 +475,11 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
     let go_dir = paths.version_dir(&go_version);
     let go_sha256: String = if !go_dir.join("bin").join("go").exists() {
         let client = http_client()?;
-        let installer = Installer { paths, client: &client, platform: Platform::detect()? };
+        let installer = Installer {
+            paths,
+            client: &client,
+            platform: Platform::detect()?,
+        };
         println!("→ installing {go_version} (required by project)");
         installer.install(&go_version).await?.sha256
     } else {
@@ -332,9 +501,9 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
     let client = http_client()?;
     for (name, spec) in &proj.tools {
         let resolved = if frozen {
-            let l = lock.find_tool(name).ok_or_else(|| anyhow!(
-                "frozen sync: tool '{name}' is in gv.toml but not in gv.lock"
-            ))?;
+            let l = lock.find_tool(name).ok_or_else(|| {
+                anyhow!("frozen sync: tool '{name}' is in gv.toml but not in gv.lock")
+            })?;
             tool::ResolvedTool {
                 name: l.name.clone(),
                 package: l.package.clone(),
@@ -347,11 +516,17 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         };
 
         let installed = tool::install(paths, &go_version, &resolved)?;
-        let already = lock.find_tool(&installed.name).map(|l| l.binary_sha256.clone());
+        let already = lock
+            .find_tool(&installed.name)
+            .map(|l| l.binary_sha256.clone());
         let new_sha = installed.binary_sha256.clone();
         lock.upsert_tool(installed);
         let bin = tool::tool_bin_path(paths, lock.find_tool(name).unwrap());
-        let suffix = if already.as_deref() == Some(new_sha.as_str()) { "(unchanged)" } else { "(updated)" };
+        let suffix = if already.as_deref() == Some(new_sha.as_str()) {
+            "(unchanged)"
+        } else {
+            "(updated)"
+        };
         println!(
             "✓ {name}@{ver} {suffix}\n  → {bin}",
             ver = resolved.version,
@@ -395,7 +570,10 @@ fn cmd_doctor(paths: &Paths, platform: Platform) -> Result<ExitCode> {
         if !lock.tools.is_empty() {
             println!("  pinned tools:");
             for t in &lock.tools {
-                println!("    - {}@{} (built with {})", t.name, t.version, t.built_with);
+                println!(
+                    "    - {}@{} (built with {})",
+                    t.name, t.version, t.built_with
+                );
             }
         }
     }
@@ -421,14 +599,14 @@ fn parse_tool_spec(spec: &str) -> (String, Option<String>) {
 }
 
 /// If a project lock pins this name, return (binary_path, version).
-fn lookup_project_tool(
-    paths: &Paths,
-    cwd: &Path,
-    name: &str,
-) -> Result<Option<(PathBuf, String)>> {
-    let Some(root) = project::find_root(cwd) else { return Ok(None); };
+fn lookup_project_tool(paths: &Paths, cwd: &Path, name: &str) -> Result<Option<(PathBuf, String)>> {
+    let Some(root) = project::find_root(cwd) else {
+        return Ok(None);
+    };
     let lock = Lock::load(&root)?;
-    let Some(t) = lock.find_tool(name) else { return Ok(None); };
+    let Some(t) = lock.find_tool(name) else {
+        return Ok(None);
+    };
     let bin = tool::tool_bin_path(paths, t);
     if bin.exists() {
         Ok(Some((bin, t.version.clone())))

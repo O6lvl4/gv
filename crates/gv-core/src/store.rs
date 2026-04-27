@@ -13,7 +13,9 @@ pub struct Store<'a> {
 }
 
 impl<'a> Store<'a> {
-    pub fn new(paths: &'a Paths) -> Self { Self { paths } }
+    pub fn new(paths: &'a Paths) -> Self {
+        Self { paths }
+    }
 
     pub fn dir_for_sha(&self, sha256: &str) -> PathBuf {
         // Use the first 16 hex chars to keep paths short while collision-safe in practice.

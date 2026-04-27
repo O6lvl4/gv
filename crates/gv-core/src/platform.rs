@@ -3,10 +3,16 @@
 use anyhow::{bail, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Os { Darwin, Linux }
+pub enum Os {
+    Darwin,
+    Linux,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Arch { Amd64, Arm64 }
+pub enum Arch {
+    Amd64,
+    Arm64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Platform {
@@ -34,8 +40,8 @@ impl Platform {
         match (self.os, self.arch) {
             (Os::Darwin, Arch::Arm64) => "darwin-arm64",
             (Os::Darwin, Arch::Amd64) => "darwin-amd64",
-            (Os::Linux,  Arch::Arm64) => "linux-arm64",
-            (Os::Linux,  Arch::Amd64) => "linux-amd64",
+            (Os::Linux, Arch::Arm64) => "linux-arm64",
+            (Os::Linux, Arch::Amd64) => "linux-amd64",
         }
     }
 }

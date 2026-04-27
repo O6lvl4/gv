@@ -88,18 +88,16 @@ pub fn load(root: &Path) -> Result<Project> {
     if !path.is_file() {
         return Ok(Project::default());
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let project: Project = toml::from_str(&raw)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let project: Project =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     Ok(project)
 }
 
 pub fn save(root: &Path, project: &Project) -> Result<()> {
     let path = root.join(PROJECT_FILE);
-    let text = toml::to_string_pretty(project)
-        .with_context(|| format!("serialize {}", path.display()))?;
-    std::fs::write(&path, text)
-        .with_context(|| format!("write {}", path.display()))?;
+    let text =
+        toml::to_string_pretty(project).with_context(|| format!("serialize {}", path.display()))?;
+    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }

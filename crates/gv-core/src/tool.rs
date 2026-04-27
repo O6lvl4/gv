@@ -14,11 +14,11 @@ use crate::{proxy, registry};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTool {
-    pub name: String,           // short name in gv.toml, e.g. "gopls"
-    pub package: String,        // full Go package path
-    pub version: String,        // concrete (e.g. "v0.18.1") — never "latest"
-    pub bin: String,            // binary name produced by `go install`
-    pub module_hash: String,    // ziphash from proxy.golang.org
+    pub name: String,        // short name in gv.toml, e.g. "gopls"
+    pub package: String,     // full Go package path
+    pub version: String,     // concrete (e.g. "v0.18.1") — never "latest"
+    pub bin: String,         // binary name produced by `go install`
+    pub module_hash: String, // ziphash from proxy.golang.org
 }
 
 /// Resolve a `gv.toml` ToolSpec to a concrete version + module hash.
@@ -41,10 +41,14 @@ pub async fn resolve(
             let (m, info) = proxy::find_module(client, &package).await?;
             (m, info.version)
         }
-        v => (resolve_module_for_explicit_version(client, &package).await?, v.to_string()),
+        v => (
+            resolve_module_for_explicit_version(client, &package).await?,
+            v.to_string(),
+        ),
     };
 
-    let module_hash = proxy::ziphash(client, &module, &version).await
+    let module_hash = proxy::ziphash(client, &module, &version)
+        .await
         .with_context(|| format!("fetch ziphash for {module}@{version}"))?;
 
     let bin = spec
@@ -65,7 +69,7 @@ pub async fn resolve(
 /// into the gv tool store. Returns the LockedTool record.
 pub fn install(
     paths: &Paths,
-    go_version: &str,           // e.g. "go1.25.0"
+    go_version: &str, // e.g. "go1.25.0"
     resolved: &ResolvedTool,
 ) -> Result<LockedTool> {
     let go_bin = paths.version_dir(go_version).join("bin").join("go");
@@ -80,11 +84,10 @@ pub fn install(
     let dest_bin = dest_dir.join(&resolved.bin);
     if !dest_bin.exists() {
         crate::paths::ensure_dir(&dest_dir)?;
-        let tmp_bin = paths.cache.join(format!(
-            "tool-{}-{}.tmp",
-            resolved.name,
-            std::process::id()
-        ));
+        let tmp_bin =
+            paths
+                .cache
+                .join(format!("tool-{}-{}.tmp", resolved.name, std::process::id()));
         let tmp_gobin = paths.cache.join(format!(
             "gobin-{}-{}.tmp",
             resolved.name,
@@ -154,7 +157,10 @@ pub fn tool_bin_path(paths: &Paths, locked: &LockedTool) -> PathBuf {
 /// Walk up `package_path` asking the proxy whether each prefix is a module.
 /// Returns the first match. Used when the user pinned an explicit version
 /// (so we still need a module path for ziphash, but skip the `@latest` query).
-async fn resolve_module_for_explicit_version(client: &reqwest::Client, package_path: &str) -> Result<String> {
+async fn resolve_module_for_explicit_version(
+    client: &reqwest::Client,
+    package_path: &str,
+) -> Result<String> {
     let (module, _) = proxy::find_module(client, package_path).await?;
     Ok(module)
 }
@@ -176,8 +182,7 @@ fn is_major_marker(s: &str) -> bool {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("hash {}", path.display()))?;
+    let mut f = std::fs::File::open(path).with_context(|| format!("hash {}", path.display()))?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut f, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
@@ -192,6 +197,9 @@ mod tests {
         assert_eq!(default_binary_name("golang.org/x/tools/gopls"), "gopls");
         assert_eq!(default_binary_name("github.com/foo/bar/cmd/x"), "x");
         assert_eq!(default_binary_name("github.com/foo/bar/v2"), "bar");
-        assert_eq!(default_binary_name("github.com/goreleaser/goreleaser/v2"), "goreleaser");
+        assert_eq!(
+            default_binary_name("github.com/goreleaser/goreleaser/v2"),
+            "goreleaser"
+        );
     }
 }

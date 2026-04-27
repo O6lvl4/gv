@@ -23,7 +23,7 @@ pub struct Installer<'a> {
 }
 
 pub struct InstallReport {
-    pub version: String,        // canonical "go1.25.0"
+    pub version: String, // canonical "go1.25.0"
     pub sha256: String,
     pub install_dir: std::path::PathBuf,
     pub already_present: bool,
@@ -36,7 +36,11 @@ impl<'a> Installer<'a> {
         self.install_file(release, file).await
     }
 
-    pub async fn install_file(&self, release: &Release, file: &ReleaseFile) -> Result<InstallReport> {
+    pub async fn install_file(
+        &self,
+        release: &Release,
+        file: &ReleaseFile,
+    ) -> Result<InstallReport> {
         self.paths.ensure_dirs()?;
         let store = Store::new(self.paths);
 
@@ -53,9 +57,14 @@ impl<'a> Installer<'a> {
         let tmp_path = self.paths.cache.join(&file.filename);
         crate::paths::ensure_dir(&self.paths.cache)?;
 
-        download_with_sha(self.client, &format!("{DL_BASE}{}", file.filename), &tmp_path, &file.sha256)
-            .await
-            .with_context(|| format!("download {}", file.filename))?;
+        download_with_sha(
+            self.client,
+            &format!("{DL_BASE}{}", file.filename),
+            &tmp_path,
+            &file.sha256,
+        )
+        .await
+        .with_context(|| format!("download {}", file.filename))?;
 
         let dest = store.dir_for_sha(&file.sha256);
         if dest.exists() {
@@ -63,8 +72,7 @@ impl<'a> Installer<'a> {
         }
         crate::paths::ensure_dir(&dest)?;
 
-        extract_tar_gz(&tmp_path, &dest)
-            .with_context(|| format!("extract {}", file.filename))?;
+        extract_tar_gz(&tmp_path, &dest).with_context(|| format!("extract {}", file.filename))?;
 
         // The Go archive contains a top-level `go/` directory; promote it.
         promote_go_subdir(&dest)?;

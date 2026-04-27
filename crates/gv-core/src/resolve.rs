@@ -27,7 +27,11 @@ pub fn resolve(paths: &Paths, cwd: &Path) -> Result<Option<Resolved>> {
     }
 
     if let Some(hit) = find_project_toolchain(cwd)? {
-        let ToolchainHit { version, source, origin } = hit;
+        let ToolchainHit {
+            version,
+            source,
+            origin,
+        } = hit;
         return Ok(Some(Resolved {
             version,
             source,
@@ -78,12 +82,20 @@ pub fn list_installed(paths: &Paths) -> Result<Vec<String>> {
 
 fn pick_latest_installed(paths: &Paths) -> Result<Option<String>> {
     let mut all = list_installed(paths)?;
-    Ok(if all.is_empty() { None } else { Some(all.remove(0)) })
+    Ok(if all.is_empty() {
+        None
+    } else {
+        Some(all.remove(0))
+    })
 }
 
 fn normalize(v: &str) -> String {
     let v = v.trim();
-    if v.starts_with("go") { v.to_string() } else { format!("go{v}") }
+    if v.starts_with("go") {
+        v.to_string()
+    } else {
+        format!("go{v}")
+    }
 }
 
 fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
@@ -95,5 +107,9 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 fn parse_components(v: &str) -> (u64, u64, u64) {
     let s = v.strip_prefix("go").unwrap_or(v);
     let mut parts = s.split('.').map(|x| x.parse::<u64>().unwrap_or(0));
-    (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
 }

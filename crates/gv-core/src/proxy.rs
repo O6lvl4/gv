@@ -20,7 +20,10 @@ pub struct VersionInfo {
 
 pub async fn latest(client: &reqwest::Client, module: &str) -> Result<VersionInfo> {
     let url = format!("{PROXY_BASE}/{}/@latest", encode_path(module));
-    let res = client.get(&url).send().await
+    let res = client
+        .get(&url)
+        .send()
+        .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()?;
     Ok(res.json().await?)
@@ -32,11 +35,17 @@ pub async fn latest(client: &reqwest::Client, module: &str) -> Result<VersionInf
 /// The Go module proxy doesn't give us a package→module lookup, so we walk
 /// up the path trying @latest at each prefix. This mirrors how `go install`
 /// resolves modules itself.
-pub async fn find_module(client: &reqwest::Client, package_path: &str) -> Result<(String, VersionInfo)> {
+pub async fn find_module(
+    client: &reqwest::Client,
+    package_path: &str,
+) -> Result<(String, VersionInfo)> {
     let mut candidate: &str = package_path;
     loop {
         let url = format!("{PROXY_BASE}/{}/@latest", encode_path(candidate));
-        let res = client.get(&url).send().await
+        let res = client
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("GET {url}"))?;
         let status = res.status();
         if status.is_success() {
@@ -46,7 +55,11 @@ pub async fn find_module(client: &reqwest::Client, package_path: &str) -> Result
             // Try the parent path.
             match candidate.rfind('/') {
                 Some(i) if i > 0 => candidate = &candidate[..i],
-                _ => return Err(anyhow!("could not resolve any module path containing {package_path}")),
+                _ => {
+                    return Err(anyhow!(
+                        "could not resolve any module path containing {package_path}"
+                    ))
+                }
             }
         } else {
             return Err(anyhow!("unexpected status {status} for {url}"));
@@ -63,7 +76,10 @@ pub async fn ziphash(client: &reqwest::Client, module: &str, version: &str) -> R
         encode_path(module),
         version
     );
-    let res = client.get(&url).send().await
+    let res = client
+        .get(&url)
+        .send()
+        .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()?;
     let body = res.text().await?;
@@ -111,7 +127,13 @@ mod tests {
     #[test]
     fn case_encoding() {
         assert_eq!(encode_path("github.com/Foo/Bar"), "github.com/!foo/!bar");
-        assert_eq!(encode_path("golang.org/x/tools/gopls"), "golang.org/x/tools/gopls");
-        assert_eq!(encode_path("github.com/Microsoft/go-winio"), "github.com/!microsoft/go-winio");
+        assert_eq!(
+            encode_path("golang.org/x/tools/gopls"),
+            "golang.org/x/tools/gopls"
+        );
+        assert_eq!(
+            encode_path("github.com/Microsoft/go-winio"),
+            "github.com/!microsoft/go-winio"
+        );
     }
 }

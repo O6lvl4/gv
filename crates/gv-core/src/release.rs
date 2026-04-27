@@ -9,7 +9,7 @@ const INDEX_URL: &str = "https://go.dev/dl/?mode=json&include=all";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
-    pub version: String,        // e.g. "go1.25.0"
+    pub version: String, // e.g. "go1.25.0"
     pub stable: bool,
     pub files: Vec<ReleaseFile>,
 }
@@ -22,7 +22,7 @@ pub struct ReleaseFile {
     pub version: String,
     pub sha256: String,
     pub size: u64,
-    pub kind: String,           // "archive" | "installer" | "source"
+    pub kind: String, // "archive" | "installer" | "source"
 }
 
 pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<Release>> {
@@ -66,17 +66,13 @@ pub fn select_archive<'a>(
     Ok((release, file))
 }
 
-/// Accept "1.25.0", "go1.25.0", "1.25" → return canonical "go1.25.0" form
-/// when the version is a full triple. For partial versions we leave them
-/// alone; resolution against the index happens elsewhere.
+/// Accept "1.25.0", "go1.25.0", "1.25" and return the canonical `go1.25.0`
+/// form. The `go` prefix is added when missing and left in place when present.
+/// We do not pad partial versions here — resolution against the release index
+/// happens elsewhere.
 pub fn normalize_version(input: &str) -> String {
-    let s = input.trim();
-    let s = s.strip_prefix("go").unwrap_or(s);
-    if s.split('.').count() == 3 {
-        format!("go{s}")
-    } else {
-        format!("go{s}")
-    }
+    let s = input.trim().strip_prefix("go").unwrap_or(input.trim());
+    format!("go{s}")
 }
 
 /// Latest stable version from the index.

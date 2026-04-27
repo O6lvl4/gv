@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolchainHit {
-    pub version: String,        // "go1.25.0"
+    pub version: String, // "go1.25.0"
     pub source: ToolchainSource,
-    pub origin: PathBuf,        // file the value came from
+    pub origin: PathBuf, // file the value came from
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,8 +57,8 @@ pub fn find_project_toolchain(start: &Path) -> Result<Option<ToolchainHit>> {
 /// Parse the `toolchain` directive from a `go.mod` file. Returns `None` if no
 /// toolchain line is present.
 pub fn read_go_mod_toolchain(go_mod: &Path) -> Result<Option<String>> {
-    let content = std::fs::read_to_string(go_mod)
-        .with_context(|| format!("read {}", go_mod.display()))?;
+    let content =
+        std::fs::read_to_string(go_mod).with_context(|| format!("read {}", go_mod.display()))?;
     for line in content.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("toolchain ") {
@@ -70,5 +70,9 @@ pub fn read_go_mod_toolchain(go_mod: &Path) -> Result<Option<String>> {
 
 fn normalize(v: &str) -> String {
     let v = v.trim();
-    if v.starts_with("go") { v.to_string() } else { format!("go{v}") }
+    if v.starts_with("go") {
+        v.to_string()
+    } else {
+        format!("go{v}")
+    }
 }

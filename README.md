@@ -35,11 +35,28 @@ Track [milestones](https://github.com/O6lvl4/gv/milestones).
 ## Install
 
 ```bash
-# Once published:
-brew install O6lvl4/tap/gv
-# or
-cargo install gv-cli
+# install.sh — downloads the latest release for your platform
+curl -fsSL https://raw.githubusercontent.com/O6lvl4/gv/main/install.sh | sh
+
+# pin a version
+GV_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/O6lvl4/gv/main/install.sh | sh
+
+# from source
+cargo install --git https://github.com/O6lvl4/gv gv-cli
 ```
+
+After installing, optionally hook the toolchain shim:
+
+```bash
+gv link            # creates ~/.local/bin/{go,gofmt} → gv-shim
+gv link --tools go,gofmt,godoc
+```
+
+This makes `go build` etc. dispatch through `gv-shim`, which honors
+`go.mod`'s `toolchain` line and `.go-version` automatically.
+
+A Homebrew tap is planned. The formula template lives at
+[`packaging/homebrew/gv.rb.template`](packaging/homebrew/gv.rb.template).
 
 ## Quickstart
 
