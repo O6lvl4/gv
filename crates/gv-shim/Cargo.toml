@@ -1,0 +1,16 @@
+[package]
+name = "gv-shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tiny exec shim for gv. Sub-millisecond toolchain dispatch."
+
+[[bin]]
+name = "gv-shim"
+path = "src/main.rs"
+
+[dependencies]
+gv-core = { path = "../gv-core" }
