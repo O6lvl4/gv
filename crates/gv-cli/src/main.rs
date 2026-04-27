@@ -1734,32 +1734,35 @@ async fn cmd_x(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
 
     // Pick a Go toolchain. Prefer the project's (so workspace tools build
     // against the same Go), otherwise the latest installed, otherwise install
-    // the latest stable.
+    // the latest stable. Whichever we land on, materialize it on disk if
+    // missing — `gvx` should "just work" without a prior `gv sync`.
     let cwd = std::env::current_dir()?;
     let go_version = match resolve::resolve(paths, &cwd)? {
         Some(r) => r.version,
         None => {
-            // Fall back: if a toolchain is already installed, use that.
-            // Otherwise install the latest stable.
             let installed = resolve::list_installed(paths)?;
             if let Some(v) = installed.into_iter().next() {
                 v
             } else {
                 let releases = release::fetch_index(&client).await?;
-                let latest = release::latest_stable(&releases)
-                    .ok_or_else(|| anyhow!("no stable Go release found"))?;
-                let installer = Installer {
-                    paths,
-                    client: &client,
-                    platform: Platform::detect()?,
-                };
-                let pb = spinner(&format!("installing {} for ephemeral run", latest.version));
-                let report = installer.install(&latest.version).await?;
-                pb.finish_and_clear();
-                report.version
+                release::latest_stable(&releases)
+                    .ok_or_else(|| anyhow!("no stable Go release found"))?
+                    .version
+                    .clone()
             }
         }
     };
+    let go_bin = paths.version_dir(&go_version).join("bin").join("go");
+    if !go_bin.exists() {
+        let installer = Installer {
+            paths,
+            client: &client,
+            platform: Platform::detect()?,
+        };
+        let pb = spinner(&format!("installing {go_version} for ephemeral run"));
+        installer.install(&go_version).await?;
+        pb.finish_and_clear();
+    }
 
     let bin_path = tool::tool_dir(paths, &resolved.name, &resolved.version).join(&resolved.bin);
 

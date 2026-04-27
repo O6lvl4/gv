@@ -6,6 +6,15 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-04-27
+
+### Fixed
+
+- `gvx` now auto-installs a missing Go toolchain. v0.5.0 resolved the
+  toolchain from `go.mod` but bailed if it wasn't already on disk; that
+  defeated the "just works" promise. The fix mirrors what `gv sync`
+  does — install on demand and continue.
+
 ## [0.5.0] — 2026-04-27
 
 uv parity sprint: `gvx`, `gv tree --deps`, global `--quiet`, `gv uninstall`,
