@@ -67,10 +67,14 @@ jobs:
 
       - name: stage artifacts
         shell: bash
+        env:
+          # When dispatched manually, inputs.tag is the source of truth — and
+          # GITHUB_REF_NAME is the dispatch branch (`main`), which we must
+          # ignore. On a tag push the input is empty and we fall through.
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
-          stage="gv-${tag}-${{ matrix.target }}"
+          stage="gv-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${stage}"
           cp "target/${{ matrix.target }}/release/gv" "dist/${stage}/gv"
           cp "target/${{ matrix.target }}/release/gv-shim" "dist/${stage}/gv-shim"
