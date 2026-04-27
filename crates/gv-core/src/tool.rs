@@ -167,14 +167,14 @@ async fn resolve_module_for_explicit_version(
 
 fn default_binary_name(package: &str) -> String {
     // `go install` names the binary after the last path segment, ignoring any
-    // trailing `/vN` major-version marker.
+    // trailing `/vN` major-version marker. On Windows, an `.exe` suffix is
+    // appended.
     let mut last = package.rsplit('/').next().unwrap_or(package);
     if is_major_marker(last) {
-        // Strip `/vN` and take the previous segment.
         let trimmed = &package[..package.len() - last.len() - 1];
         last = trimmed.rsplit('/').next().unwrap_or(trimmed);
     }
-    last.to_string()
+    format!("{}{}", last, std::env::consts::EXE_SUFFIX)
 }
 
 fn is_major_marker(s: &str) -> bool {
@@ -194,12 +194,22 @@ mod tests {
 
     #[test]
     fn binary_name_default() {
-        assert_eq!(default_binary_name("golang.org/x/tools/gopls"), "gopls");
-        assert_eq!(default_binary_name("github.com/foo/bar/cmd/x"), "x");
-        assert_eq!(default_binary_name("github.com/foo/bar/v2"), "bar");
+        let exe = std::env::consts::EXE_SUFFIX;
+        assert_eq!(
+            default_binary_name("golang.org/x/tools/gopls"),
+            format!("gopls{exe}")
+        );
+        assert_eq!(
+            default_binary_name("github.com/foo/bar/cmd/x"),
+            format!("x{exe}")
+        );
+        assert_eq!(
+            default_binary_name("github.com/foo/bar/v2"),
+            format!("bar{exe}")
+        );
         assert_eq!(
             default_binary_name("github.com/goreleaser/goreleaser/v2"),
-            "goreleaser"
+            format!("goreleaser{exe}")
         );
     }
 }

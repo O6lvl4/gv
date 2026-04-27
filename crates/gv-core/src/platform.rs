@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 pub enum Os {
     Darwin,
     Linux,
+    Windows,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,7 @@ impl Platform {
         let os = match std::env::consts::OS {
             "macos" => Os::Darwin,
             "linux" => Os::Linux,
+            "windows" => Os::Windows,
             other => bail!("unsupported OS: {other}"),
         };
         let arch = match std::env::consts::ARCH {
@@ -42,6 +44,16 @@ impl Platform {
             (Os::Darwin, Arch::Amd64) => "darwin-amd64",
             (Os::Linux, Arch::Arm64) => "linux-arm64",
             (Os::Linux, Arch::Amd64) => "linux-amd64",
+            (Os::Windows, Arch::Amd64) => "windows-amd64",
+            (Os::Windows, Arch::Arm64) => "windows-arm64",
+        }
+    }
+
+    /// Suffix appended to executable names on this platform.
+    pub fn exe_suffix(&self) -> &'static str {
+        match self.os {
+            Os::Windows => ".exe",
+            _ => "",
         }
     }
 }

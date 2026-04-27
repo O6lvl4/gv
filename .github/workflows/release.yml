@@ -38,6 +38,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             cross: true
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
     steps:
       - uses: actions/checkout@v4
 
@@ -72,16 +75,26 @@ jobs:
           # GITHUB_REF_NAME is the dispatch branch (`main`), which we must
           # ignore. On a tag push the input is empty and we fall through.
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          stage="gv-${TAG}-${{ matrix.target }}"
+          stage="gv-${TAG}-${TARGET}"
           mkdir -p "dist/${stage}"
-          cp "target/${{ matrix.target }}/release/gv" "dist/${stage}/gv"
-          cp "target/${{ matrix.target }}/release/gv-shim" "dist/${stage}/gv-shim"
+          ext=""
+          if [[ "$TARGET" == *windows* ]]; then ext=".exe"; fi
+          cp "target/${TARGET}/release/gv${ext}"      "dist/${stage}/gv${ext}"
+          cp "target/${TARGET}/release/gv-shim${ext}" "dist/${stage}/gv-shim${ext}"
           cp README.md LICENSE "dist/${stage}/" 2>/dev/null || true
           cd dist
           tar -czf "${stage}.tar.gz" "${stage}"
-          shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          # shasum may not be present on windows runners; use sha256sum/openssl as fallback.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          elif command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          else
+            openssl dgst -sha256 -r "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

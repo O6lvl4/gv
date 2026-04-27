@@ -6,7 +6,25 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-27
+
 ### Added
+
+- **`gv init`** — bootstrap a `gv.toml` in the current directory. Honors
+  `go.mod` toolchain / `.go-version` for the toolchain pin or falls back to
+  the latest stable Go release. `--with foo,bar` preselects tools, `--go
+  X.Y.Z` overrides the toolchain pin, `--force` overwrites an existing file.
+- **`gv self-update`** — fetch the latest `O6lvl4/gv` release, sha256-verify,
+  atomic-replace the running binary plus its sibling `gv-shim`. `--check`
+  reports without installing. Skips if already on the newest release.
+- **Windows support** (phase 2 MVP) — `x86_64-pc-windows-msvc` is now built
+  in the release matrix. The toolchain installer auto-detects `.zip` vs
+  `.tar.gz` archives via the file extension. Tool binaries inherit the
+  host's `.exe` suffix. `gv link` / `gv unlink` on Windows copy the shim
+  with a sidecar marker file (no symlink privilege required) and refuse to
+  remove unmanaged binaries.
+
+### Performance
 
 - **Parallel resolve + install** in `gv sync` and `gv add tool`. Tool resolution
   fans out via `try_join_all`; tool builds run on `tokio::task::spawn_blocking`

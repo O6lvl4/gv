@@ -13,6 +13,7 @@ use gv_core::platform::Platform;
 use gv_core::project::{self, ToolSpec};
 use gv_core::{release, resolve, tool};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use sha2::Digest;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -82,6 +83,25 @@ enum Cmd {
         bin_dir: Option<PathBuf>,
         #[arg(long, value_delimiter = ',')]
         tools: Option<Vec<String>>,
+    },
+    /// Initialize gv.toml in the current directory.
+    Init {
+        /// Comma-separated tool names to preselect (e.g. `gopls,golangci-lint`).
+        #[arg(long, value_delimiter = ',')]
+        with: Option<Vec<String>>,
+        /// Override the toolchain pin (default: read go.mod / .go-version,
+        /// or fall back to the latest stable Go release).
+        #[arg(long)]
+        go: Option<String>,
+        /// Overwrite an existing gv.toml.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Update gv to the latest release.
+    SelfUpdate {
+        /// Only check for a newer release; don't install.
+        #[arg(long)]
+        check: bool,
     },
     /// Print the resolved environment as a tree.
     Tree,
@@ -161,6 +181,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             force,
         } => cmd_link(bin_dir, shim, tools, force),
         Cmd::Unlink { bin_dir, tools } => cmd_unlink(bin_dir, tools),
+        Cmd::Init { with, go, force } => cmd_init(with, go, force).await,
+        Cmd::SelfUpdate { check } => cmd_self_update(platform, check).await,
         Cmd::Tree => cmd_tree(&paths),
         Cmd::Upgrade { names, toolchain } => cmd_upgrade(&paths, platform, names, toolchain).await,
         Cmd::Cache { op } => match op {
@@ -207,29 +229,48 @@ fn cmd_link(
     }
     std::fs::create_dir_all(&bin_dir).with_context(|| format!("create {}", bin_dir.display()))?;
 
-    for name in &tools {
-        let dest = bin_dir.join(name);
+    for raw in &tools {
+        let name = if cfg!(windows) && !raw.ends_with(".exe") {
+            format!("{raw}.exe")
+        } else {
+            raw.clone()
+        };
+        let dest = bin_dir.join(&name);
+        let marker = bin_dir.join(format!(".{name}.gv-managed"));
         if dest.exists() || dest.is_symlink() {
             if !force {
-                let is_our_link = std::fs::read_link(&dest)
-                    .map(|p| p == shim)
-                    .unwrap_or(false);
-                if is_our_link {
-                    println!("✓ {name} already links to gv-shim");
+                let owned_by_us = if cfg!(windows) {
+                    marker.exists()
+                } else {
+                    std::fs::read_link(&dest)
+                        .map(|p| p == shim)
+                        .unwrap_or(false)
+                };
+                if owned_by_us {
+                    println!("✓ {name} already managed by gv");
                     continue;
                 } else {
                     println!(
-                        "! {name} exists at {} and is not our shim — skipping (use --force)",
+                        "! {name} exists at {} and is not managed by gv — skipping (use --force)",
                         dest.display()
                     );
                     continue;
                 }
             }
             std::fs::remove_file(&dest).ok();
+            let _ = std::fs::remove_file(&marker);
         }
-        symlink(&shim, &dest)
-            .with_context(|| format!("link {} -> {}", dest.display(), shim.display()))?;
-        println!("✓ linked {name} → gv-shim");
+        if cfg!(windows) {
+            std::fs::copy(&shim, &dest)
+                .with_context(|| format!("copy {} -> {}", shim.display(), dest.display()))?;
+            std::fs::write(&marker, "")
+                .with_context(|| format!("write marker {}", marker.display()))?;
+            println!("✓ installed {name} (copy of gv-shim)");
+        } else {
+            symlink(&shim, &dest)
+                .with_context(|| format!("link {} -> {}", dest.display(), shim.display()))?;
+            println!("✓ linked {name} → gv-shim");
+        }
     }
 
     if !path_contains(&bin_dir) {
@@ -249,18 +290,29 @@ fn cmd_unlink(bin_dir: Option<PathBuf>, tools: Option<Vec<String>>) -> Result<Ex
     let tools: Vec<String> =
         tools.unwrap_or_else(|| STD_GO_TOOLS.iter().map(|s| s.to_string()).collect());
 
-    for name in &tools {
-        let dest = bin_dir.join(name);
+    for raw in &tools {
+        let name = if cfg!(windows) && !raw.ends_with(".exe") {
+            format!("{raw}.exe")
+        } else {
+            raw.clone()
+        };
+        let dest = bin_dir.join(&name);
+        let marker = bin_dir.join(format!(".{name}.gv-managed"));
         if !dest.exists() && !dest.is_symlink() {
             continue;
         }
-        // Only remove if it's a symlink (don't blow away a real binary by accident).
-        if dest.is_symlink() {
+        let owned_by_us = if cfg!(windows) {
+            marker.exists()
+        } else {
+            dest.is_symlink()
+        };
+        if owned_by_us {
             std::fs::remove_file(&dest).with_context(|| format!("remove {}", dest.display()))?;
+            let _ = std::fs::remove_file(&marker);
             println!("✓ unlinked {name}");
         } else {
             println!(
-                "! {name} at {} is a real file (not a symlink) — leaving it",
+                "! {name} at {} is not managed by gv — leaving it",
                 dest.display()
             );
         }
@@ -384,16 +436,35 @@ fn cmd_which(paths: &Paths, name: &str) -> Result<ExitCode> {
 
     let r = resolve::resolve(paths, &cwd)?
         .ok_or_else(|| anyhow!("no Go version resolved in {}", cwd.display()))?;
-    let bin = paths.version_dir(&r.version).join("bin").join(name);
-    if !bin.exists() {
-        return Err(anyhow!(
-            "{} not found in {} (is the toolchain installed?)",
-            name,
-            paths.version_dir(&r.version).display()
-        ));
-    }
+    let bin = find_toolchain_binary(&paths.version_dir(&r.version).join("bin"), name).ok_or_else(
+        || {
+            anyhow!(
+                "{} not found in {} (is the toolchain installed?)",
+                name,
+                paths.version_dir(&r.version).display()
+            )
+        },
+    )?;
     println!("{}", bin.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Look up an executable in `bin_dir` honoring the host's executable suffix.
+/// Tries `<name>` first, then `<name>{EXE_SUFFIX}` so users can type `go`
+/// even when the installed binary is `go.exe`.
+fn find_toolchain_binary(bin_dir: &Path, name: &str) -> Option<PathBuf> {
+    let direct = bin_dir.join(name);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
+    if !exe_suffix.is_empty() && !name.ends_with(exe_suffix) {
+        let with_suffix = bin_dir.join(format!("{name}{exe_suffix}"));
+        if with_suffix.exists() {
+            return Some(with_suffix);
+        }
+    }
+    None
 }
 
 fn cmd_use_global(paths: &Paths, version: &str) -> Result<ExitCode> {
@@ -418,12 +489,8 @@ fn cmd_run(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
     let (exe, version_dir) = match (exe, r.as_ref()) {
         (Some(p), Some(r)) => (p, paths.version_dir(&r.version)),
         (None, Some(r)) => {
-            let toolchain_bin = paths.version_dir(&r.version).join("bin").join(cmd);
-            let exe = if toolchain_bin.exists() {
-                toolchain_bin
-            } else {
-                PathBuf::from(cmd)
-            };
+            let bin_dir = paths.version_dir(&r.version).join("bin");
+            let exe = find_toolchain_binary(&bin_dir, cmd).unwrap_or_else(|| PathBuf::from(cmd));
             (exe, paths.version_dir(&r.version))
         }
         (Some(p), None) => (p, PathBuf::new()),
@@ -651,6 +718,262 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
 
     if !frozen {
         lock.save(root)?;
+    }
+    Ok(())
+}
+
+// ----- gv init --------------------------------------------------------------
+
+async fn cmd_init(with: Option<Vec<String>>, go: Option<String>, force: bool) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let target = cwd.join(project::PROJECT_FILE);
+    if target.exists() && !force {
+        bail!(
+            "{} already exists (use --force to overwrite)",
+            target.display()
+        );
+    }
+
+    // Resolve a sensible Go pin: explicit flag > go.mod toolchain > .go-version > latest stable.
+    let go_pin = match go {
+        Some(v) => Some(release::normalize_version(&v)),
+        None => match gv_core::manifest::find_project_toolchain(&cwd)? {
+            Some(hit) => Some(hit.version),
+            None => {
+                let pb = spinner("resolving latest Go release");
+                let client = http_client()?;
+                let releases = release::fetch_index(&client).await?;
+                pb.finish_and_clear();
+                release::latest_stable(&releases).map(|r| r.version.clone())
+            }
+        },
+    };
+
+    let mut proj = project::Project {
+        go: go_pin.as_deref().map(|v| gv_core::project::GoSection {
+            version: v.to_string(),
+        }),
+        tools: Default::default(),
+    };
+
+    if let Some(names) = with {
+        for raw in names {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let (name, version) = parse_tool_spec(raw);
+            // Validate: must be in registry or have an explicit @ pin.
+            if version.is_none() && gv_core::registry::lookup(&name).is_none() {
+                bail!("unknown tool '{name}' — pick from the registry or pass `name@version`");
+            }
+            proj.tools.insert(
+                name,
+                ToolSpec::Short(version.unwrap_or_else(|| "latest".to_string())),
+            );
+        }
+    }
+
+    project::save(&cwd, &proj)?;
+    println!("{} wrote {}", success_mark(), target.display());
+    if let Some(v) = go_pin {
+        println!("    toolchain : {v}");
+    }
+    if proj.tools.is_empty() {
+        println!(
+            "    tools     : {} ({})",
+            dim("(none)"),
+            dim("add later via `gv add tool <name>`")
+        );
+    } else {
+        println!("    tools     :");
+        for (name, spec) in &proj.tools {
+            println!("      - {name} = \"{}\"", spec.version());
+        }
+    }
+    println!("{}", dim("    next      : run `gv sync` to install everything"));
+    Ok(ExitCode::SUCCESS)
+}
+
+// ----- gv self update -------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct GhRelease {
+    tag_name: String,
+}
+
+async fn cmd_self_update(platform: Platform, check: bool) -> Result<ExitCode> {
+    let current = env!("CARGO_PKG_VERSION");
+    let client = http_client()?;
+    let release: GhRelease = client
+        .get("https://api.github.com/repos/O6lvl4/gv/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("parse GitHub release JSON")?;
+    let latest_tag = release.tag_name; // "v0.2.0"
+    let latest = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
+
+    if !is_semver_newer(latest, current) {
+        println!(
+            "{} gv is already up to date {}",
+            success_mark(),
+            dim(&format!("(installed: {current}, latest: {latest})"))
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if check {
+        println!(
+            "{} a newer release is available: {} {} {}",
+            success_mark(),
+            dim(current),
+            dim("→"),
+            color_bold(latest)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let triple =
+        target_triple().ok_or_else(|| anyhow!("self-update is not supported on this platform"))?;
+    let asset_stem = format!("gv-{latest_tag}-{triple}");
+    let _ = platform;
+    let archive_name = if cfg!(target_os = "windows") {
+        format!("{asset_stem}.zip")
+    } else {
+        format!("{asset_stem}.tar.gz")
+    };
+    let url = format!("https://github.com/O6lvl4/gv/releases/download/{latest_tag}/{archive_name}");
+    let sha_url = format!("{url}.sha256");
+
+    let pb = spinner(&format!("downloading {archive_name}"));
+    let bytes = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let sha_text = client
+        .get(&sha_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    pb.finish_and_clear();
+
+    // Verify sha256.
+    let expected: String = sha_text.split_whitespace().next().unwrap_or("").to_string();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    let actual = hex::encode(hasher.finalize());
+    if !expected.is_empty() && expected != actual {
+        bail!("sha256 mismatch: expected {expected}, got {actual}");
+    }
+
+    // Extract gv + gv-shim into a temp dir.
+    let tmp = tempdir_in(std::env::temp_dir(), "gv-self-update-")?;
+    let archive_path = tmp.join(&archive_name);
+    std::fs::write(&archive_path, &bytes)?;
+    gv_core::install::extract_archive(&archive_path, &tmp)?;
+
+    let stage = tmp.join(&asset_stem);
+    let new_gv = stage.join(if cfg!(windows) { "gv.exe" } else { "gv" });
+    let new_shim = stage.join(if cfg!(windows) {
+        "gv-shim.exe"
+    } else {
+        "gv-shim"
+    });
+    if !new_gv.exists() || !new_shim.exists() {
+        bail!(
+            "extracted archive missing expected binaries at {}",
+            stage.display()
+        );
+    }
+
+    // Atomic replace.
+    let current_exe = std::env::current_exe()?;
+    let parent = current_exe.parent().unwrap_or(Path::new("."));
+    let shim_dest = parent.join(if cfg!(windows) {
+        "gv-shim.exe"
+    } else {
+        "gv-shim"
+    });
+    replace_binary(&new_gv, &current_exe)?;
+    replace_binary(&new_shim, &shim_dest).ok(); // shim is best-effort
+
+    println!(
+        "{} gv {} → {}",
+        success_mark(),
+        dim(current),
+        color_bold(latest)
+    );
+    println!("    binary    : {}", current_exe.display());
+    println!("    shim      : {}", shim_dest.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn target_triple() -> Option<&'static str> {
+    Some(match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        _ => return None,
+    })
+}
+
+fn is_semver_newer(latest: &str, current: &str) -> bool {
+    fn parse(s: &str) -> (u64, u64, u64) {
+        let mut parts = s.split('.').map(|p| p.split('-').next().unwrap_or(""));
+        (
+            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
+            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
+            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
+        )
+    }
+    parse(latest) > parse(current)
+}
+
+fn tempdir_in(parent: impl AsRef<Path>, prefix: &str) -> Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let p = parent.as_ref().join(format!("{prefix}{nonce}"));
+    std::fs::create_dir_all(&p)?;
+    Ok(p)
+}
+
+fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
+    // On Unix, std::fs::rename across the running binary is allowed because
+    // the kernel tracks running processes by inode. On Windows, the running
+    // .exe cannot be replaced; rename it aside first then move new in.
+    if cfg!(windows) && dest.exists() {
+        let backup = dest.with_extension("old");
+        let _ = std::fs::remove_file(&backup);
+        std::fs::rename(dest, &backup)
+            .with_context(|| format!("rename {} → {}", dest.display(), backup.display()))?;
+    }
+    std::fs::rename(src, dest)
+        .or_else(|_| {
+            // Cross-device rename not allowed → copy + remove.
+            std::fs::copy(src, dest)
+                .map(|_| ())
+                .and_then(|_| std::fs::remove_file(src))
+        })
+        .with_context(|| format!("install binary at {}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dest)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dest, perms)?;
     }
     Ok(())
 }

@@ -72,7 +72,7 @@ impl<'a> Installer<'a> {
         }
         crate::paths::ensure_dir(&dest)?;
 
-        extract_tar_gz(&tmp_path, &dest).with_context(|| format!("extract {}", file.filename))?;
+        extract_archive(&tmp_path, &dest).with_context(|| format!("extract {}", file.filename))?;
 
         // The Go archive contains a top-level `go/` directory; promote it.
         promote_go_subdir(&dest)?;
@@ -119,6 +119,20 @@ async fn download_with_sha(
     Ok(())
 }
 
+/// Dispatch on the archive extension. Go ships .tar.gz for unix and .zip for
+/// windows; we use the same helper for `gv self-update`.
+pub fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
+    let name = archive
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.ends_with(".zip") {
+        extract_zip(archive, dest)
+    } else {
+        extract_tar_gz(archive, dest)
+    }
+}
+
 fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
     let f = std::fs::File::open(archive)?;
     let gz = GzDecoder::new(f);
@@ -126,6 +140,36 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
     tar.set_preserve_permissions(true);
     tar.set_overwrite(true);
     tar.unpack(dest)?;
+    Ok(())
+}
+
+fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
+    let f = std::fs::File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(f).context("open zip")?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let outpath = match entry.enclosed_name() {
+            Some(p) => dest.join(p),
+            None => continue,
+        };
+        if entry.is_dir() {
+            std::fs::create_dir_all(&outpath)?;
+            continue;
+        }
+        if let Some(parent) = outpath.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&outpath)
+            .with_context(|| format!("create {}", outpath.display()))?;
+        std::io::copy(&mut entry, &mut out)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = entry.unix_mode() {
+                std::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+    }
     Ok(())
 }
 

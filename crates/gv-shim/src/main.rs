@@ -31,18 +31,30 @@ fn try_main() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no Go version resolved".to_string())?;
 
-    let bin = paths
-        .version_dir(&resolved.version)
-        .join("bin")
-        .join(&tool_name);
-    if !bin.exists() {
-        return Err(format!(
-            "{} not found at {} — run `gv install {}`",
-            tool_name.to_string_lossy(),
-            bin.display(),
-            resolved.version
-        ));
-    }
+    let bin_dir = paths.version_dir(&resolved.version).join("bin");
+    let bin = bin_dir.join(&tool_name);
+    let bin = if bin.exists() {
+        bin
+    } else {
+        // Honor the host's exe suffix: someone may have linked `go` as the
+        // shim name on a Windows host where the real binary is `go.exe`.
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let mut candidate = tool_name.clone();
+        if !suffix.is_empty() && !tool_name.to_string_lossy().ends_with(suffix) {
+            candidate.push(suffix);
+        }
+        let with_suffix = bin_dir.join(&candidate);
+        if with_suffix.exists() {
+            with_suffix
+        } else {
+            return Err(format!(
+                "{} not found at {} — run `gv install {}`",
+                tool_name.to_string_lossy(),
+                bin.display(),
+                resolved.version
+            ));
+        }
+    };
 
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
 

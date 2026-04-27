@@ -51,6 +51,7 @@ pub fn select_archive<'a>(
     let want_os = match platform.os {
         crate::platform::Os::Darwin => "darwin",
         crate::platform::Os::Linux => "linux",
+        crate::platform::Os::Windows => "windows",
     };
     let want_arch = match platform.arch {
         crate::platform::Arch::Amd64 => "amd64",

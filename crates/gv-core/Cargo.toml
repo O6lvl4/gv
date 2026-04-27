@@ -20,6 +20,7 @@ sha2.workspace = true
 hex.workspace = true
 flate2.workspace = true
 tar.workspace = true
+zip.workspace = true
 directories.workspace = true
 semver.workspace = true
 futures.workspace = true
