@@ -72,9 +72,10 @@ and is bumped automatically on every stable release by the `bump-tap` job in
 template). Pre-release tags (those containing `-`, e.g. `v0.2.0-rc1`) skip the
 bump.
 
-> **Maintainer note**: the bump job needs a repo secret `TAP_TOKEN` on
-> `O6lvl4/gv` containing a fine-grained PAT with `Contents: read+write` on
-> `O6lvl4/homebrew-tap`.
+> **Maintainer note**: the bump job authenticates with a deploy key.
+> `O6lvl4/homebrew-tap` carries a read-write SSH deploy key whose private
+> half is stored as the `TAP_DEPLOY_KEY` secret on `O6lvl4/gv`. Rotating is
+> a two-step `gh repo deploy-key` + `gh secret set` dance — no PATs needed.
 
 ## Quickstart
 
