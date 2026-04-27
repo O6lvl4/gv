@@ -17,7 +17,20 @@ shell pollution of legacy version managers.
 
 ## Status
 
-🚧 Pre-alpha. MVP in progress. Track [milestones](https://github.com/O6lvl4/gv/milestones).
+🚧 Pre-alpha. Working today:
+
+- Toolchain install / list / current / use-global / doctor
+- Content-addressed store + symlink farm
+- `go.mod` `toolchain` line read as a first-class source
+- `.go-version` + `~/.config/gv/global` fallbacks
+- **Tool pinning**: `gv add tool gopls` resolves via `proxy.golang.org`, fetches
+  the directory hash from `sum.golang.org` (the canonical Go checksum DB),
+  builds via the resolved Go toolchain, records everything in `gv.lock`
+- `gv sync --frozen` for CI: refuses to touch the lock, fails if `gv.toml`
+  drifts ahead of `gv.lock`
+- `gv-shim` 400KB binary for IDE-side `execve` dispatch
+
+Track [milestones](https://github.com/O6lvl4/gv/milestones).
 
 ## Install
 
