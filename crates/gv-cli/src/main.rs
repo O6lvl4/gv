@@ -749,10 +749,15 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         pb.finish_with_message(format!("installed {go_version}"));
         sha
     } else {
-        // Recover sha from the existing store layout: store dir name = sha256[..16].
+        // Recover the *full* sha from the `.gv-installed` marker. The store
+        // dir name is only the 16-char prefix; using it as the lock's
+        // `[go] sha256` would silently break reproducibility checks.
         let target = std::fs::read_link(&go_dir).ok();
-        let recovered = target
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+        let marker = target.as_deref().map(|p| p.join(".gv-installed"));
+        let recovered = marker
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string())
             .unwrap_or_default();
         say!(
             "{} {go_version} {}",
@@ -765,11 +770,22 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
     // Step 2 — tools.
     if proj.tools.is_empty() {
         if !frozen {
+            // The manifest no longer pins anything; mirror that in the lock.
+            // (Frozen mode preserves whatever is on disk.)
+            let removed = lock.tools.len();
+            lock.tools.clear();
             lock.go = Some(gv_core::lock::LockedGo {
                 version: go_version.clone(),
                 sha256: go_sha256,
             });
             lock.save(root)?;
+            if removed > 0 {
+                println!(
+                    " {} pruned {removed} stale lock entr{}",
+                    dim("-"),
+                    if removed == 1 { "y" } else { "ies" }
+                );
+            }
         }
         println!("{}", dim("(no tools to sync)"));
         return Ok(());
@@ -848,6 +864,34 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         summary.push((new.name.clone(), new.version.clone(), mark));
         lock.upsert_tool(new);
     }
+
+    // Drop any lock entries that no longer appear in gv.toml — the lock
+    // should track the manifest, not accumulate stale tools forever.
+    // (Frozen syncs skip this so an out-of-band lock edit isn't silently
+    // erased.)
+    if !frozen {
+        let known: std::collections::HashSet<&str> =
+            proj.tools.keys().map(|s| s.as_str()).collect();
+        let before = lock.tools.len();
+        lock.tools.retain(|t| known.contains(t.name.as_str()));
+        let removed = before - lock.tools.len();
+        if removed > 0 {
+            for t in lock.tools.iter() {
+                let _ = t;
+            }
+            // We just need to surface the removal count; per-name lines would
+            // require remembering the diff, which isn't worth it.
+            summary.push((
+                format!(
+                    "(pruned {removed} stale lock entr{})",
+                    if removed == 1 { "y" } else { "ies" }
+                ),
+                String::new(),
+                '-',
+            ));
+        }
+    }
+
     summary.sort();
 
     say!(
@@ -861,11 +905,13 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         let glyph = match mark {
             '+' => format!(" {}", color_green("+")),
             '~' => format!(" {}", color_yellow("~")),
+            '-' => format!(" {}", dim("-")),
             _ => format!(" {}", dim("=")),
         };
         let detail = match mark {
             '+' => format!("{name}@{version} {}", dim("(new)")),
             '~' => format!("{name}@{version} {}", dim("(changed)")),
+            '-' => name.clone(),
             _ => format!("{name}@{version} {}", dim("(unchanged)")),
         };
         println!("{glyph} {detail}");

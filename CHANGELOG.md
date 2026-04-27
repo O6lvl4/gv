@@ -6,6 +6,37 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-04-27
+
+Two real bugs surfaced by an exhaustive validation suite (≈90 unique
+checks across panic-free input fuzzing, full resolution-chain
+verification, store/symlink integrity, lock-file robustness, race
+stress, workspace edges, and signal/exit propagation).
+
+### Fixed
+
+- **Lock's `[go] sha256` was the 16-char store-prefix instead of the
+  full 64-char digest.** When sync ran against a toolchain that was
+  *already* installed (e.g. via a prior `gv install`), it recovered
+  the sha by reading the symlink target's basename — which is only
+  the prefix used as a store key. Now read the canonical full sha
+  from the `.gv-installed` marker that `mark_installed` already
+  writes. Reproducibility checks against the lock would have
+  silently degraded otherwise.
+- **`gv sync` did not drop tools that left `gv.toml`.** A tool that
+  was once pinned and later removed from the manifest stayed in the
+  lock forever, which is wrong: the lock is a snapshot of the
+  manifest, not an additive log. Non-frozen syncs now retain only
+  the tools currently in `gv.toml`. `--frozen` preserves the
+  on-disk lock untouched, as expected.
+
+### Changed
+
+- Empty `[tools]` table now also clears the lock (was previously a
+  no-op that left old entries).
+- `sync` summary gains a ` - pruned N stale lock entries` line so the
+  drop is visible.
+
 ## [0.5.1] — 2026-04-27
 
 ### Fixed
