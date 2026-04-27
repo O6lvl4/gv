@@ -60,7 +60,9 @@ main() {
   url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
 
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  # The trap fires after main returns, when locals are out of scope. Use a
+  # parameter default so set -u doesn't complain about an "unset" tmpdir.
+  trap 'rm -rf "${tmpdir:-}"' EXIT
 
   say "downloading $asset"
   curl -fsSL "$url" -o "${tmpdir}/${asset}"
