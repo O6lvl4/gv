@@ -1,15 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use futures::future::try_join_all;
 use gv_core::install::Installer;
-use gv_core::lock::Lock;
+use gv_core::lock::{Lock, LockedTool};
 use gv_core::manifest::ToolchainSource;
 use gv_core::paths::Paths;
 use gv_core::platform::Platform;
 use gv_core::project::{self, ToolSpec};
 use gv_core::{release, resolve, tool};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -80,8 +83,36 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         tools: Option<Vec<String>>,
     },
+    /// Print the resolved environment as a tree.
+    Tree,
+    /// Re-resolve pinned tools (and optionally the toolchain) to their latest
+    /// matching versions. Updates gv.lock and re-installs anything that moved.
+    Upgrade {
+        /// Specific tool name(s) to upgrade. Default: all pinned tools.
+        names: Vec<String>,
+        /// Also upgrade the Go toolchain to `latest`.
+        #[arg(long)]
+        toolchain: bool,
+    },
+    /// Inspect or prune the gv data directories.
+    Cache {
+        #[command(subcommand)]
+        op: CacheCmd,
+    },
     /// Health check.
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCmd {
+    /// Show disk usage by category.
+    Info,
+    /// Remove store entries no longer referenced.
+    Prune {
+        /// Show what would be removed without doing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 const STD_GO_TOOLS: &[&str] = &["go", "gofmt"];
@@ -130,6 +161,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             force,
         } => cmd_link(bin_dir, shim, tools, force),
         Cmd::Unlink { bin_dir, tools } => cmd_unlink(bin_dir, tools),
+        Cmd::Tree => cmd_tree(&paths),
+        Cmd::Upgrade { names, toolchain } => cmd_upgrade(&paths, platform, names, toolchain).await,
+        Cmd::Cache { op } => match op {
+            CacheCmd::Info => cmd_cache_info(&paths),
+            CacheCmd::Prune { dry_run } => cmd_cache_prune(&paths, dry_run),
+        },
         Cmd::Doctor => cmd_doctor(&paths, platform),
     }
 }
@@ -460,8 +497,8 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
     let mut lock = Lock::load(root)?;
 
     // Step 1 — Go toolchain. Honor go.mod, fall back to gv.toml.
-    let resolved = resolve::resolve(paths, root)?;
-    let go_version = match resolved {
+    let resolved_toolchain = resolve::resolve(paths, root)?;
+    let go_version = match resolved_toolchain {
         Some(r) => r.version,
         None => proj
             .go
@@ -480,58 +517,131 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
             client: &client,
             platform: Platform::detect()?,
         };
-        println!("→ installing {go_version} (required by project)");
-        installer.install(&go_version).await?.sha256
+        let pb = spinner(&format!("installing {go_version}"));
+        let sha = installer.install(&go_version).await?.sha256;
+        pb.finish_with_message(format!("installed {go_version}"));
+        sha
     } else {
-        println!("✓ {go_version} present");
         // Recover sha from the existing store layout: store dir name = sha256[..16].
         let target = std::fs::read_link(&go_dir).ok();
-        target
+        let recovered = target
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        println!(
+            "{} {go_version} {}",
+            success_mark(),
+            dim("(already present)")
+        );
+        recovered
     };
 
     // Step 2 — tools.
     if proj.tools.is_empty() {
-        println!("(no tools to sync)");
-        lock.save(root)?;
+        if !frozen {
+            lock.go = Some(gv_core::lock::LockedGo {
+                version: go_version.clone(),
+                sha256: go_sha256,
+            });
+            lock.save(root)?;
+        }
+        println!("{}", dim("(no tools to sync)"));
         return Ok(());
     }
 
     let client = http_client()?;
-    for (name, spec) in &proj.tools {
-        let resolved = if frozen {
-            let l = lock.find_tool(name).ok_or_else(|| {
-                anyhow!("frozen sync: tool '{name}' is in gv.toml but not in gv.lock")
-            })?;
-            tool::ResolvedTool {
-                name: l.name.clone(),
-                package: l.package.clone(),
-                version: l.version.clone(),
-                bin: l.bin.clone(),
-                module_hash: l.module_hash.clone(),
-            }
-        } else {
-            tool::resolve(&client, name, spec).await?
-        };
+    let mp = MultiProgress::new();
 
-        let installed = tool::install(paths, &go_version, &resolved)?;
-        let already = lock
-            .find_tool(&installed.name)
-            .map(|l| l.binary_sha256.clone());
-        let new_sha = installed.binary_sha256.clone();
-        lock.upsert_tool(installed);
-        let bin = tool::tool_bin_path(paths, lock.find_tool(name).unwrap());
-        let suffix = if already.as_deref() == Some(new_sha.as_str()) {
-            "(unchanged)"
-        } else {
-            "(updated)"
+    // -- resolve all tools in parallel ---------------------------------------
+    let resolve_started = Instant::now();
+    let resolve_futs = proj.tools.iter().map(|(name, spec)| {
+        let client = client.clone();
+        let mp = mp.clone();
+        let lock_ref = &lock;
+        let name = name.clone();
+        let spec = spec.clone();
+        async move {
+            let pb = mp.add(spinner(&format!("resolving {name}")));
+            let resolved = if frozen {
+                let l = lock_ref.find_tool(&name).ok_or_else(|| {
+                    anyhow!("frozen sync: tool '{name}' is in gv.toml but not in gv.lock")
+                })?;
+                tool::ResolvedTool {
+                    name: l.name.clone(),
+                    package: l.package.clone(),
+                    version: l.version.clone(),
+                    bin: l.bin.clone(),
+                    module_hash: l.module_hash.clone(),
+                }
+            } else {
+                tool::resolve(&client, &name, &spec).await?
+            };
+            pb.finish_and_clear();
+            Ok::<_, anyhow::Error>(resolved)
+        }
+    });
+    let resolved: Vec<tool::ResolvedTool> = try_join_all(resolve_futs).await?;
+    let resolve_ms = resolve_started.elapsed().as_millis();
+    println!(
+        "{} Resolved {} tool{} in {}",
+        success_mark(),
+        resolved.len(),
+        plural(resolved.len()),
+        format_duration(resolve_ms)
+    );
+
+    // -- install all tools in parallel ---------------------------------------
+    let install_started = Instant::now();
+    let install_futs = resolved.iter().map(|r| {
+        let mp = mp.clone();
+        let paths = paths.clone();
+        let go_version = go_version.clone();
+        let r = r.clone();
+        async move {
+            let pb = mp.add(spinner(&format!("building {}@{}", r.name, r.version)));
+            let res = tokio::task::spawn_blocking(move || tool::install(&paths, &go_version, &r))
+                .await
+                .map_err(|e| anyhow!("install task panicked: {e}"))??;
+            pb.finish_and_clear();
+            Ok::<_, anyhow::Error>(res)
+        }
+    });
+    let installed: Vec<LockedTool> = try_join_all(install_futs).await?;
+    let install_ms = install_started.elapsed().as_millis();
+
+    // -- merge into lock + summarize -----------------------------------------
+    let mut summary: Vec<(String, String, char)> = Vec::with_capacity(installed.len());
+    for new in installed {
+        let prev_sha = lock.find_tool(&new.name).map(|l| l.binary_sha256.clone());
+        let prev_ver = lock.find_tool(&new.name).map(|l| l.version.clone());
+        let mark = match (prev_sha, prev_ver) {
+            (None, _) => '+',
+            (_, Some(v)) if v != new.version => '~',
+            _ => '=',
         };
-        println!(
-            "✓ {name}@{ver} {suffix}\n  → {bin}",
-            ver = resolved.version,
-            bin = bin.display()
-        );
+        summary.push((new.name.clone(), new.version.clone(), mark));
+        lock.upsert_tool(new);
+    }
+    summary.sort();
+
+    println!(
+        "{} Built {} tool{} in {}",
+        success_mark(),
+        summary.len(),
+        plural(summary.len()),
+        format_duration(install_ms)
+    );
+    for (name, version, mark) in &summary {
+        let glyph = match mark {
+            '+' => format!(" {}", color_green("+")),
+            '~' => format!(" {}", color_yellow("~")),
+            _ => format!(" {}", dim("=")),
+        };
+        let detail = match mark {
+            '+' => format!("{name}@{version} {}", dim("(new)")),
+            '~' => format!("{name}@{version} {}", dim("(changed)")),
+            _ => format!("{name}@{version} {}", dim("(unchanged)")),
+        };
+        println!("{glyph} {detail}");
     }
 
     lock.go = Some(gv_core::lock::LockedGo {
@@ -539,13 +649,461 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         sha256: go_sha256,
     });
 
-    if frozen {
-        // Don't re-write the lock in frozen mode (it should already match).
-    } else {
+    if !frozen {
         lock.save(root)?;
-        println!("✓ wrote {}", root.join("gv.lock").display());
     }
     Ok(())
+}
+
+// ----- gv tree --------------------------------------------------------------
+
+fn cmd_tree(paths: &Paths) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let root = project::find_root(&cwd);
+
+    println!("{}", color_bold("gv tree"));
+
+    // Toolchain branch
+    let resolved = resolve::resolve(paths, &cwd)?;
+    match resolved.as_ref() {
+        Some(r) => {
+            let store_path = paths.version_dir(&r.version);
+            let store_target = std::fs::read_link(&store_path).ok();
+            println!("├── {} {}", color_cyan("toolchain"), color_bold(&r.version));
+            println!("│   ├── source: {}", source_label(r));
+            if let Some(t) = store_target {
+                println!("│   └── store:  {}", t.display());
+            } else {
+                println!("│   └── store:  {}", store_path.display());
+            }
+        }
+        None => println!("├── {} {}", color_cyan("toolchain"), dim("(none)")),
+    }
+
+    // Tools branch
+    let lock = match root.as_deref() {
+        Some(r) => Lock::load(r).unwrap_or_else(|_| Lock::empty()),
+        None => Lock::empty(),
+    };
+    if lock.tools.is_empty() {
+        println!("└── {} {}", color_cyan("tools"), dim("(none pinned)"));
+    } else {
+        println!("└── {} ({})", color_cyan("tools"), lock.tools.len());
+        let last = lock.tools.len() - 1;
+        for (i, t) in lock.tools.iter().enumerate() {
+            let (branch, indent) = if i == last {
+                ("└──", "    ")
+            } else {
+                ("├──", "│   ")
+            };
+            let bin = tool::tool_bin_path(paths, t);
+            let bin_status = if bin.exists() {
+                color_green("present")
+            } else {
+                color_yellow("missing")
+            };
+            println!(
+                "    {branch} {} @ {}  [{}]",
+                color_bold(&t.name),
+                t.version,
+                bin_status
+            );
+            println!("    {indent}├── package : {}", t.package);
+            println!("    {indent}├── h1      : {}", t.module_hash);
+            println!("    {indent}├── built   : with {}", t.built_with);
+            println!("    {indent}└── bin     : {}", bin.display());
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn source_label(r: &resolve::Resolved) -> String {
+    use ToolchainSource::*;
+    match r.source {
+        EnvVar => "GV_VERSION".into(),
+        GoMod => format!(
+            "go.mod toolchain ({})",
+            r.origin.as_deref().map(display_path).unwrap_or_default()
+        ),
+        GoVersionFile => format!(
+            ".go-version ({})",
+            r.origin.as_deref().map(display_path).unwrap_or_default()
+        ),
+        Global => "global".into(),
+        LatestInstalled => "latest installed".into(),
+    }
+}
+
+// ----- gv upgrade -----------------------------------------------------------
+
+async fn cmd_upgrade(
+    paths: &Paths,
+    _platform: Platform,
+    names: Vec<String>,
+    toolchain: bool,
+) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let root = project::find_root(&cwd).ok_or_else(|| {
+        anyhow!(
+            "no project root found (need a go.mod or gv.toml above {})",
+            cwd.display()
+        )
+    })?;
+    let proj = project::load(&root)?;
+    let mut lock = Lock::load(&root)?;
+    let client = http_client()?;
+
+    let target_names: Vec<String> = if names.is_empty() {
+        proj.tools.keys().cloned().collect()
+    } else {
+        for n in &names {
+            if !proj.tools.contains_key(n) {
+                bail!("tool '{n}' is not pinned in gv.toml");
+            }
+        }
+        names
+    };
+
+    if target_names.is_empty() && !toolchain {
+        println!("{}", dim("(no tools to upgrade)"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Determine the active Go toolchain. We need it to build any tool that moved.
+    let go_version = match resolve::resolve(paths, &root)? {
+        Some(r) => r.version,
+        None => bail!("no Go version is resolvable; run `gv sync` first"),
+    };
+
+    // ----- toolchain upgrade --------------------------------------------------
+    if toolchain {
+        let releases = release::fetch_index(&client).await?;
+        let latest = release::latest_stable(&releases)
+            .ok_or_else(|| anyhow!("no stable Go release found"))?;
+        let new_version = latest.version.clone();
+        if new_version == go_version {
+            println!(
+                "{} toolchain {} {}",
+                success_mark(),
+                new_version,
+                dim("(already latest)")
+            );
+        } else {
+            let installer = Installer {
+                paths,
+                client: &client,
+                platform: Platform::detect()?,
+            };
+            let pb = spinner(&format!("upgrading toolchain → {new_version}"));
+            let report = installer.install(&new_version).await?;
+            pb.finish_and_clear();
+            // Persist to gv.toml so future syncs honor it (without stomping go.mod).
+            let mut proj_w = project::load(&root)?;
+            proj_w.go = Some(gv_core::project::GoSection {
+                version: new_version.clone(),
+            });
+            project::save(&root, &proj_w)?;
+            lock.go = Some(gv_core::lock::LockedGo {
+                version: new_version.clone(),
+                sha256: report.sha256,
+            });
+            println!(
+                "{} toolchain {} → {}",
+                color_green("~"),
+                go_version,
+                color_bold(&new_version)
+            );
+        }
+    }
+
+    if target_names.is_empty() {
+        lock.save(&root)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // ----- per-target tool upgrade -------------------------------------------
+    let mp = MultiProgress::new();
+    let resolve_started = Instant::now();
+    let resolve_futs = target_names.iter().map(|name| {
+        let client = client.clone();
+        let mp = mp.clone();
+        let name = name.clone();
+        async move {
+            let pb = mp.add(spinner(&format!("resolving {name}@latest")));
+            let resolved = tool::resolve(&client, &name, &ToolSpec::Short("latest".into())).await?;
+            pb.finish_and_clear();
+            Ok::<_, anyhow::Error>(resolved)
+        }
+    });
+    let resolved: Vec<tool::ResolvedTool> = try_join_all(resolve_futs).await?;
+    println!(
+        "{} Resolved {} tool{} in {}",
+        success_mark(),
+        resolved.len(),
+        plural(resolved.len()),
+        format_duration(resolve_started.elapsed().as_millis())
+    );
+
+    // Decide which actually changed.
+    let mut to_install: Vec<tool::ResolvedTool> = Vec::new();
+    let mut bumps: Vec<(String, String, String)> = Vec::new(); // name, old, new
+    let mut skipped: Vec<String> = Vec::new();
+    for r in resolved {
+        match lock.find_tool(&r.name).map(|l| l.version.clone()) {
+            Some(prev) if prev == r.version => skipped.push(r.name.clone()),
+            prev => {
+                bumps.push((
+                    r.name.clone(),
+                    prev.unwrap_or_else(|| "(none)".into()),
+                    r.version.clone(),
+                ));
+                to_install.push(r);
+            }
+        }
+    }
+
+    if to_install.is_empty() {
+        for n in &skipped {
+            println!("  {} {n} {}", dim("="), dim("(already latest)"));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let install_started = Instant::now();
+    let install_futs = to_install.iter().map(|r| {
+        let mp = mp.clone();
+        let paths = paths.clone();
+        let go_version = go_version.clone();
+        let r = r.clone();
+        async move {
+            let pb = mp.add(spinner(&format!("building {}@{}", r.name, r.version)));
+            let res = tokio::task::spawn_blocking(move || tool::install(&paths, &go_version, &r))
+                .await
+                .map_err(|e| anyhow!("install task panicked: {e}"))??;
+            pb.finish_and_clear();
+            Ok::<_, anyhow::Error>(res)
+        }
+    });
+    let installed: Vec<LockedTool> = try_join_all(install_futs).await?;
+    println!(
+        "{} Built {} tool{} in {}",
+        success_mark(),
+        installed.len(),
+        plural(installed.len()),
+        format_duration(install_started.elapsed().as_millis())
+    );
+
+    for new in installed {
+        lock.upsert_tool(new);
+    }
+    lock.save(&root)?;
+
+    for (name, old, new) in &bumps {
+        println!(
+            " {} {name}: {} → {}",
+            color_green("~"),
+            dim(old),
+            color_bold(new)
+        );
+    }
+    for n in &skipped {
+        println!("  {} {n} {}", dim("="), dim("(already latest)"));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ----- gv cache -------------------------------------------------------------
+
+fn cmd_cache_info(paths: &Paths) -> Result<ExitCode> {
+    let entries = [
+        ("store    ", paths.store()),
+        ("versions ", paths.versions()),
+        ("tools    ", paths.data.join("tools")),
+        ("cache    ", paths.cache.clone()),
+        ("config   ", paths.config.clone()),
+    ];
+    println!("{}", color_bold("gv cache"));
+    let mut total: u64 = 0;
+    for (label, path) in &entries {
+        let (size, count) = if path.exists() {
+            dir_size(path)?
+        } else {
+            (0, 0)
+        };
+        total += size;
+        println!(
+            "  {} {:>10}  {:>5} entr{}  {}",
+            label,
+            humanize(size),
+            count,
+            if count == 1 { "y" } else { "ies" },
+            dim(&path.display().to_string())
+        );
+    }
+    println!("  {} {:>10}", color_bold("total    "), humanize(total));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_cache_prune(paths: &Paths, dry_run: bool) -> Result<ExitCode> {
+    let store = paths.store();
+    let versions = paths.versions();
+    if !store.exists() {
+        println!("{}", dim("(empty store)"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Collect referenced store dirs (read symlink targets under versions/).
+    let mut referenced = std::collections::HashSet::new();
+    if versions.exists() {
+        for entry in std::fs::read_dir(&versions)? {
+            let entry = entry?;
+            if let Ok(target) = std::fs::read_link(entry.path()) {
+                referenced.insert(target.canonicalize().unwrap_or(target));
+            }
+        }
+    }
+
+    let mut to_remove: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in std::fs::read_dir(&store)? {
+        let entry = entry?;
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let canon = p.canonicalize().unwrap_or(p.clone());
+        if !referenced.contains(&canon) {
+            let (size, _) = dir_size(&p)?;
+            to_remove.push((p, size));
+        }
+    }
+
+    if to_remove.is_empty() {
+        println!("{} nothing to prune", success_mark());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let total: u64 = to_remove.iter().map(|(_, s)| *s).sum();
+    let verb = if dry_run { "would remove" } else { "removed" };
+    for (p, sz) in &to_remove {
+        println!("  {} {:>10}  {}", verb, humanize(*sz), p.display());
+        if !dry_run {
+            std::fs::remove_dir_all(p).with_context(|| format!("remove {}", p.display()))?;
+        }
+    }
+    println!(
+        "{} {} {} unreferenced store entr{} ({})",
+        success_mark(),
+        verb,
+        to_remove.len(),
+        if to_remove.len() == 1 { "y" } else { "ies" },
+        humanize(total)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn dir_size(path: &Path) -> Result<(u64, usize)> {
+    let mut total: u64 = 0;
+    let mut count: usize = 0;
+    if path.is_file() {
+        return Ok((std::fs::metadata(path)?.len(), 1));
+    }
+    if !path.is_dir() {
+        return Ok((0, 0));
+    }
+    let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)? {
+            let entry = entry?;
+            let p = entry.path();
+            let meta = entry.metadata()?;
+            if meta.is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if d == path {
+                    count += 1;
+                }
+                stack.push(p);
+            } else {
+                if d == path {
+                    count += 1;
+                }
+                total += meta.len();
+            }
+        }
+    }
+    Ok((total, count))
+}
+
+fn humanize(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes == 0 {
+        return "0 B".into();
+    }
+    let mut value = bytes as f64;
+    let mut idx = 0;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if value >= 100.0 || idx == 0 {
+        format!("{:.0} {}", value, UNITS[idx])
+    } else {
+        format!("{:.1} {}", value, UNITS[idx])
+    }
+}
+
+fn color_cyan(s: &str) -> String {
+    format!("\x1b[36m{s}\x1b[0m")
+}
+fn color_bold(s: &str) -> String {
+    format!("\x1b[1m{s}\x1b[0m")
+}
+
+// ----- presentation helpers --------------------------------------------------
+
+fn spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("  {spinner:.green} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
+}
+
+fn success_mark() -> &'static str {
+    "\x1b[32m✓\x1b[0m"
+}
+fn dim(s: &str) -> String {
+    format!("\x1b[2m{s}\x1b[0m")
+}
+fn color_green(s: &str) -> String {
+    format!("\x1b[32m{s}\x1b[0m")
+}
+fn color_yellow(s: &str) -> String {
+    format!("\x1b[33m{s}\x1b[0m")
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn format_duration(ms: u128) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.2}s", ms as f64 / 1_000.0)
+    } else {
+        let total_s = ms / 1_000;
+        format!("{}m{:02}s", total_s / 60, total_s % 60)
+    }
 }
 
 fn cmd_doctor(paths: &Paths, platform: Platform) -> Result<ExitCode> {

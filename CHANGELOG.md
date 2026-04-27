@@ -6,6 +6,27 @@ All notable changes to gv are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Parallel resolve + install** in `gv sync` and `gv add tool`. Tool resolution
+  fans out via `try_join_all`; tool builds run on `tokio::task::spawn_blocking`
+  pools. Three-tool sync went from ~50 s sequential to ~31 s wall on a
+  3-tool project (CPU 175%, network-bound on `go install` downloads).
+- **uv-style summary lines** with `indicatif` spinners per tool and timings:
+  `Resolved N tools in 234 ms` / `Built N tools in 4.5 s` plus a `+` (new) /
+  `~` (changed) / `=` (unchanged) marker per tool.
+- **`gv tree`** — hierarchical view of the resolved environment: toolchain
+  with its source, then each pinned tool with package, module hash,
+  built-with version, and binary path. Highlights `present` vs `missing`.
+- **`gv upgrade [TOOL...] [--toolchain]`** — re-resolves `@latest` for the
+  named tools (or all pinned tools when no name is given). Only re-installs
+  what actually moved; reports `name: old → new` cleanly. `--toolchain`
+  also bumps the Go release to the latest stable.
+- **`gv cache info`** — disk usage breakdown across `store/`, `versions/`,
+  `tools/`, `cache/`, `config/` with humanized sizes.
+- **`gv cache prune [--dry-run]`** — removes content-addressed store entries
+  no longer referenced by any `versions/` symlink.
+
 ## [0.1.0] — pre-release
 
 ### Added
