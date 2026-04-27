@@ -1,5 +1,9 @@
 # gv
 
+[![ci](https://github.com/O6lvl4/gv/actions/workflows/ci.yml/badge.svg)](https://github.com/O6lvl4/gv/actions/workflows/ci.yml)
+[![release](https://github.com/O6lvl4/gv/actions/workflows/release.yml/badge.svg)](https://github.com/O6lvl4/gv/actions/workflows/release.yml)
+[![license](https://img.shields.io/github/license/O6lvl4/gv)](LICENSE)
+
 > Go version & toolchain manager. uv-grade speed. Single binary. Reproducible.
 
 `gv` is to Go what `uv` is to Python: one fast Rust binary that owns toolchains,

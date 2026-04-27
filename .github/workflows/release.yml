@@ -27,7 +27,9 @@ jobs:
             runner: macos-14
             cross: false
           - target: x86_64-apple-darwin
-            runner: macos-13
+            # macos-13 (intel) was deprecated; cross-compile from arm64 instead.
+            # Apple's clang/SDK on macos-14 supports x86_64 darwin natively.
+            runner: macos-14
             cross: false
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
