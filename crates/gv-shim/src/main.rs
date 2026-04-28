@@ -25,7 +25,7 @@ fn try_main() -> Result<(), String> {
         .ok_or_else(|| "could not determine tool name from argv[0]".to_string())?
         .to_owned();
 
-    let paths = gv_core::paths::Paths::discover().map_err(|e| e.to_string())?;
+    let paths = gv_core::paths::discover().map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let resolved = gv_core::resolve::resolve(&paths, &cwd)
         .map_err(|e| e.to_string())?

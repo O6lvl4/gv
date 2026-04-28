@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Core library for gv: resolve, install, store, manifest, lock."
 
 [dependencies]
+anyv-core = { git = "https://github.com/O6lvl4/anyv-core", tag = "v0.1.0" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

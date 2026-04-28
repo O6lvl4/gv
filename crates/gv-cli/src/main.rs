@@ -1,8 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
+use anyv_core::fs::dir_size;
+use anyv_core::presentation::{
+    bold as color_bold, cyan as color_cyan, dim, format_duration_ms, green as color_green,
+    humanize_bytes as humanize, plural, quote_ps, quote_sh, set_quiet, spinner, success_mark,
+    yellow as color_yellow,
+};
+use anyv_core::say;
+use anyv_core::selfupdate::{Outcome, SelfUpdate};
 use clap::{Parser, Subcommand};
 use futures::future::try_join_all;
 use gv_core::install::Installer;
@@ -12,8 +20,7 @@ use gv_core::paths::Paths;
 use gv_core::platform::Platform;
 use gv_core::project::{self, ToolSpec};
 use gv_core::{release, resolve, tool};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use sha2::Digest;
+use indicatif::MultiProgress;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -243,43 +250,13 @@ enum AddCmd {
     Tool { spec: String },
 }
 
-/// Global verbosity gate. Set once from `--quiet`; helpers consult it.
-static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn quiet() -> bool {
-    QUIET.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// `say!` works like `println!` but stays silent under `--quiet`.
-macro_rules! say {
-    ($($arg:tt)*) => {{
-        if !quiet() {
-            println!($($arg)*);
-        }
-    }};
-}
-
 fn main() -> ExitCode {
-    // argv[0]-based dispatch: when the binary is invoked as `gvx` (symlink or
-    // copy), inject `x` as the first positional so users don't have to type
-    // `gv x …`. Mirrors uv's `uvx` shim.
-    let argv0_basename = std::env::args_os()
-        .next()
-        .and_then(|p| {
-            Path::new(&p)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
-        .unwrap_or_default();
-    let cli = if argv0_basename == "gvx" {
-        let injected = std::iter::once("gv".to_string())
-            .chain(std::iter::once("x".to_string()))
-            .chain(std::env::args().skip(1));
-        Cli::parse_from(injected)
-    } else {
-        Cli::parse()
+    // Honor the `gvx` shim trick (argv[0] dispatch).
+    let cli = match anyv_core::argv0::rewrite_for_x_dispatch("gv") {
+        Some(rewritten) => Cli::parse_from(rewritten),
+        None => Cli::parse(),
     };
-    QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
+    set_quiet(cli.quiet);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -294,7 +271,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    let paths = Paths::discover()?;
+    let paths = gv_core::paths::discover()?;
     paths.ensure_dirs()?;
     let platform = Platform::detect()?;
 
@@ -744,7 +721,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
             client: &client,
             platform: Platform::detect()?,
         };
-        let pb = spinner(&format!("installing {go_version}"));
+        let pb = spinner(format!("installing {go_version}"));
         let sha = installer.install(&go_version).await?.sha256;
         pb.finish_with_message(format!("installed {go_version}"));
         sha
@@ -803,7 +780,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         let name = name.clone();
         let spec = spec.clone();
         async move {
-            let pb = mp.add(spinner(&format!("resolving {name}")));
+            let pb = mp.add(spinner(format!("resolving {name}")));
             let resolved = if frozen {
                 let l = lock_ref.find_tool(&name).ok_or_else(|| {
                     anyhow!("frozen sync: tool '{name}' is in gv.toml but not in gv.lock")
@@ -829,7 +806,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         success_mark(),
         resolved.len(),
         plural(resolved.len()),
-        format_duration(resolve_ms)
+        format_duration_ms(resolve_ms)
     );
 
     // -- install all tools in parallel ---------------------------------------
@@ -840,7 +817,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         let go_version = go_version.clone();
         let r = r.clone();
         async move {
-            let pb = mp.add(spinner(&format!("building {}@{}", r.name, r.version)));
+            let pb = mp.add(spinner(format!("building {}@{}", r.name, r.version)));
             let res = tokio::task::spawn_blocking(move || tool::install(&paths, &go_version, &r))
                 .await
                 .map_err(|e| anyhow!("install task panicked: {e}"))??;
@@ -899,7 +876,7 @@ async fn sync_project(paths: &Paths, root: &Path, frozen: bool) -> Result<()> {
         success_mark(),
         summary.len(),
         plural(summary.len()),
-        format_duration(install_ms)
+        format_duration_ms(install_ms)
     );
     for (name, version, mark) in &summary {
         let glyph = match mark {
@@ -1006,185 +983,51 @@ async fn cmd_init(with: Option<Vec<String>>, go: Option<String>, force: bool) ->
 
 // ----- gv self update -------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct GhRelease {
-    tag_name: String,
-}
-
-async fn cmd_self_update(platform: Platform, check: bool) -> Result<ExitCode> {
-    let current = env!("CARGO_PKG_VERSION");
-    let client = http_client()?;
-    let release: GhRelease = client
-        .get("https://api.github.com/repos/O6lvl4/gv/releases/latest")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await
-        .context("parse GitHub release JSON")?;
-    let latest_tag = release.tag_name; // "v0.2.0"
-    let latest = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
-
-    if !is_semver_newer(latest, current) {
-        println!(
-            "{} gv is already up to date {}",
-            success_mark(),
-            dim(&format!("(installed: {current}, latest: {latest})"))
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-    if check {
-        println!(
-            "{} a newer release is available: {} {} {}",
-            success_mark(),
-            dim(current),
-            dim("→"),
-            color_bold(latest)
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    let triple =
-        target_triple().ok_or_else(|| anyhow!("self-update is not supported on this platform"))?;
-    let asset_stem = format!("gv-{latest_tag}-{triple}");
-    let _ = platform;
-    let archive_name = if cfg!(target_os = "windows") {
-        format!("{asset_stem}.zip")
-    } else {
-        format!("{asset_stem}.tar.gz")
+async fn cmd_self_update(_platform: Platform, check: bool) -> Result<ExitCode> {
+    let updater = SelfUpdate {
+        repo: "O6lvl4/gv",
+        bin_name: "gv",
+        current_version: env!("CARGO_PKG_VERSION"),
     };
-    let url = format!("https://github.com/O6lvl4/gv/releases/download/{latest_tag}/{archive_name}");
-    let sha_url = format!("{url}.sha256");
-
-    let pb = spinner(&format!("downloading {archive_name}"));
-    let bytes = client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    let sha_text = client
-        .get(&sha_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    pb.finish_and_clear();
-
-    // Verify sha256.
-    let expected: String = sha_text.split_whitespace().next().unwrap_or("").to_string();
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(&bytes);
-    let actual = hex::encode(hasher.finalize());
-    if !expected.is_empty() && expected != actual {
-        bail!("sha256 mismatch: expected {expected}, got {actual}");
+    let client = http_client()?;
+    let info = updater.run(&client, check).await?;
+    match info.outcome {
+        Outcome::AlreadyUpToDate => {
+            println!(
+                "{} gv is already up to date {}",
+                success_mark(),
+                dim(&format!(
+                    "(installed: {}, latest: {})",
+                    info.current, info.latest
+                ))
+            );
+        }
+        Outcome::NewerAvailable => {
+            println!(
+                "{} a newer release is available: {} {} {}",
+                success_mark(),
+                dim(&info.current),
+                dim("→"),
+                color_bold(&info.latest)
+            );
+        }
+        Outcome::Updated => {
+            println!(
+                "{} gv {} → {}",
+                success_mark(),
+                dim(&info.current),
+                color_bold(&info.latest)
+            );
+            if let Some(p) = info.binary_path {
+                println!("    binary    : {}", p.display());
+            }
+            // gv-shim is intentionally not refreshed here. Its argv[0]
+            // dispatch logic is stable across versions, and `brew upgrade`
+            // already replaces both binaries. Out-of-band installs (curl
+            // | sh) likewise re-stage both.
+        }
     }
-
-    // Extract gv + gv-shim into a temp dir.
-    let tmp = tempdir_in(std::env::temp_dir(), "gv-self-update-")?;
-    let archive_path = tmp.join(&archive_name);
-    std::fs::write(&archive_path, &bytes)?;
-    gv_core::install::extract_archive(&archive_path, &tmp)?;
-
-    let stage = tmp.join(&asset_stem);
-    let new_gv = stage.join(if cfg!(windows) { "gv.exe" } else { "gv" });
-    let new_shim = stage.join(if cfg!(windows) {
-        "gv-shim.exe"
-    } else {
-        "gv-shim"
-    });
-    if !new_gv.exists() || !new_shim.exists() {
-        bail!(
-            "extracted archive missing expected binaries at {}",
-            stage.display()
-        );
-    }
-
-    // Atomic replace.
-    let current_exe = std::env::current_exe()?;
-    let parent = current_exe.parent().unwrap_or(Path::new("."));
-    let shim_dest = parent.join(if cfg!(windows) {
-        "gv-shim.exe"
-    } else {
-        "gv-shim"
-    });
-    replace_binary(&new_gv, &current_exe)?;
-    replace_binary(&new_shim, &shim_dest).ok(); // shim is best-effort
-
-    println!(
-        "{} gv {} → {}",
-        success_mark(),
-        dim(current),
-        color_bold(latest)
-    );
-    println!("    binary    : {}", current_exe.display());
-    println!("    shim      : {}", shim_dest.display());
     Ok(ExitCode::SUCCESS)
-}
-
-fn target_triple() -> Option<&'static str> {
-    Some(match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
-        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
-        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
-        _ => return None,
-    })
-}
-
-fn is_semver_newer(latest: &str, current: &str) -> bool {
-    fn parse(s: &str) -> (u64, u64, u64) {
-        let mut parts = s.split('.').map(|p| p.split('-').next().unwrap_or(""));
-        (
-            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
-            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
-            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
-        )
-    }
-    parse(latest) > parse(current)
-}
-
-fn tempdir_in(parent: impl AsRef<Path>, prefix: &str) -> Result<PathBuf> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let p = parent.as_ref().join(format!("{prefix}{nonce}"));
-    std::fs::create_dir_all(&p)?;
-    Ok(p)
-}
-
-fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
-    // On Unix, std::fs::rename across the running binary is allowed because
-    // the kernel tracks running processes by inode. On Windows, the running
-    // .exe cannot be replaced; rename it aside first then move new in.
-    if cfg!(windows) && dest.exists() {
-        let backup = dest.with_extension("old");
-        let _ = std::fs::remove_file(&backup);
-        std::fs::rename(dest, &backup)
-            .with_context(|| format!("rename {} → {}", dest.display(), backup.display()))?;
-    }
-    std::fs::rename(src, dest)
-        .or_else(|_| {
-            // Cross-device rename not allowed → copy + remove.
-            std::fs::copy(src, dest)
-                .map(|_| ())
-                .and_then(|_| std::fs::remove_file(src))
-        })
-        .with_context(|| format!("install binary at {}", dest.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(dest)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(dest, perms)?;
-    }
-    Ok(())
 }
 
 // ----- gv outdated ----------------------------------------------------------
@@ -1222,10 +1065,7 @@ async fn cmd_outdated(paths: &Paths, _platform: Platform) -> Result<ExitCode> {
 
     // Tools (parallel @latest fetches)
     if !proj.tools.is_empty() {
-        let pb = spinner(&format!(
-            "checking {} tool(s) for updates",
-            proj.tools.len()
-        ));
+        let pb = spinner(format!("checking {} tool(s) for updates", proj.tools.len()));
         let futs = proj.tools.keys().map(|name| {
             let client = client.clone();
             let name = name.clone();
@@ -1336,7 +1176,7 @@ async fn cmd_migrate_tools(from: Option<PathBuf>, dry_run: bool) -> Result<ExitC
 
     let client = http_client()?;
     let mut additions: Vec<(String, String)> = Vec::new(); // (gv name, package)
-    let pb = spinner(&format!("resolving {} import(s)", imports.len()));
+    let pb = spinner(format!("resolving {} import(s)", imports.len()));
     for pkg in &imports {
         let (_module, _info) = gv_core::proxy::find_module(&client, pkg).await?;
         let name = derive_tool_name(pkg);
@@ -1774,7 +1614,7 @@ async fn cmd_x(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
     let spec_obj = ToolSpec::Short(version.unwrap_or_else(|| "latest".to_string()));
 
     let client = http_client()?;
-    let pb = spinner(&format!("resolving {name}"));
+    let pb = spinner(format!("resolving {name}"));
     let resolved = tool::resolve(&client, &name, &spec_obj).await?;
     pb.finish_and_clear();
 
@@ -1805,7 +1645,7 @@ async fn cmd_x(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
             client: &client,
             platform: Platform::detect()?,
         };
-        let pb = spinner(&format!("installing {go_version} for ephemeral run"));
+        let pb = spinner(format!("installing {go_version} for ephemeral run"));
         installer.install(&go_version).await?;
         pb.finish_and_clear();
     }
@@ -1813,7 +1653,7 @@ async fn cmd_x(paths: &Paths, argv: Vec<String>) -> Result<ExitCode> {
     let bin_path = tool::tool_dir(paths, &resolved.name, &resolved.version).join(&resolved.bin);
 
     if !bin_path.exists() {
-        let pb = spinner(&format!("building {}@{}", resolved.name, resolved.version));
+        let pb = spinner(format!("building {}@{}", resolved.name, resolved.version));
         let resolved_clone = resolved.clone();
         let paths_clone = paths.clone();
         let go_version_clone = go_version.clone();
@@ -1905,7 +1745,7 @@ async fn cmd_lock(paths: &Paths) -> Result<ExitCode> {
     });
 
     if !proj.tools.is_empty() {
-        let pb = spinner(&format!("re-resolving {} tool(s)", proj.tools.len()));
+        let pb = spinner(format!("re-resolving {} tool(s)", proj.tools.len()));
         let futs = proj.tools.iter().map(|(name, spec)| {
             let client = client.clone();
             let name = name.clone();
@@ -2048,7 +1888,7 @@ async fn cmd_upgrade(
                 client: &client,
                 platform: Platform::detect()?,
             };
-            let pb = spinner(&format!("upgrading toolchain → {new_version}"));
+            let pb = spinner(format!("upgrading toolchain → {new_version}"));
             let report = installer.install(&new_version).await?;
             pb.finish_and_clear();
             // Persist to gv.toml so future syncs honor it (without stomping go.mod).
@@ -2083,7 +1923,7 @@ async fn cmd_upgrade(
         let mp = mp.clone();
         let name = name.clone();
         async move {
-            let pb = mp.add(spinner(&format!("resolving {name}@latest")));
+            let pb = mp.add(spinner(format!("resolving {name}@latest")));
             let resolved = tool::resolve(&client, &name, &ToolSpec::Short("latest".into())).await?;
             pb.finish_and_clear();
             Ok::<_, anyhow::Error>(resolved)
@@ -2095,7 +1935,7 @@ async fn cmd_upgrade(
         success_mark(),
         resolved.len(),
         plural(resolved.len()),
-        format_duration(resolve_started.elapsed().as_millis())
+        format_duration_ms(resolve_started.elapsed().as_millis())
     );
 
     // Decide which actually changed.
@@ -2130,7 +1970,7 @@ async fn cmd_upgrade(
         let go_version = go_version.clone();
         let r = r.clone();
         async move {
-            let pb = mp.add(spinner(&format!("building {}@{}", r.name, r.version)));
+            let pb = mp.add(spinner(format!("building {}@{}", r.name, r.version)));
             let res = tokio::task::spawn_blocking(move || tool::install(&paths, &go_version, &r))
                 .await
                 .map_err(|e| anyhow!("install task panicked: {e}"))??;
@@ -2144,7 +1984,7 @@ async fn cmd_upgrade(
         success_mark(),
         installed.len(),
         plural(installed.len()),
-        format_duration(install_started.elapsed().as_millis())
+        format_duration_ms(install_started.elapsed().as_millis())
     );
 
     for new in installed {
@@ -2202,14 +2042,6 @@ fn cmd_env(paths: &Paths, shell: EnvShell) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-fn quote_sh(s: &str) -> String {
-    // Single-quote, escape any embedded single quotes.
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-fn quote_ps(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
 }
 
 // ----- gv cache -------------------------------------------------------------
@@ -2358,114 +2190,6 @@ fn cmd_cache_prune(paths: &Paths, dry_run: bool, go_cache: bool) -> Result<ExitC
     }
 
     Ok(ExitCode::SUCCESS)
-}
-
-fn dir_size(path: &Path) -> Result<(u64, usize)> {
-    let mut total: u64 = 0;
-    let mut count: usize = 0;
-    if path.is_file() {
-        return Ok((std::fs::metadata(path)?.len(), 1));
-    }
-    if !path.is_dir() {
-        return Ok((0, 0));
-    }
-    let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d)? {
-            let entry = entry?;
-            let p = entry.path();
-            let meta = entry.metadata()?;
-            if meta.is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                if d == path {
-                    count += 1;
-                }
-                stack.push(p);
-            } else {
-                if d == path {
-                    count += 1;
-                }
-                total += meta.len();
-            }
-        }
-    }
-    Ok((total, count))
-}
-
-fn humanize(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes == 0 {
-        return "0 B".into();
-    }
-    let mut value = bytes as f64;
-    let mut idx = 0;
-    while value >= 1024.0 && idx < UNITS.len() - 1 {
-        value /= 1024.0;
-        idx += 1;
-    }
-    if value >= 100.0 || idx == 0 {
-        format!("{:.0} {}", value, UNITS[idx])
-    } else {
-        format!("{:.1} {}", value, UNITS[idx])
-    }
-}
-
-fn color_cyan(s: &str) -> String {
-    format!("\x1b[36m{s}\x1b[0m")
-}
-fn color_bold(s: &str) -> String {
-    format!("\x1b[1m{s}\x1b[0m")
-}
-
-// ----- presentation helpers --------------------------------------------------
-
-fn spinner(msg: &str) -> ProgressBar {
-    if quiet() {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("  {spinner:.green} {msg}")
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.set_message(msg.to_string());
-    pb.enable_steady_tick(Duration::from_millis(80));
-    pb
-}
-
-fn success_mark() -> &'static str {
-    "\x1b[32m✓\x1b[0m"
-}
-fn dim(s: &str) -> String {
-    format!("\x1b[2m{s}\x1b[0m")
-}
-fn color_green(s: &str) -> String {
-    format!("\x1b[32m{s}\x1b[0m")
-}
-fn color_yellow(s: &str) -> String {
-    format!("\x1b[33m{s}\x1b[0m")
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
-fn format_duration(ms: u128) -> String {
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.2}s", ms as f64 / 1_000.0)
-    } else {
-        let total_s = ms / 1_000;
-        format!("{}m{:02}s", total_s / 60, total_s % 60)
-    }
 }
 
 fn cmd_doctor(paths: &Paths, platform: Platform) -> Result<ExitCode> {

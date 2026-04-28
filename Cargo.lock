@@ -74,6 +74,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "anyv-core"
+version = "0.1.0"
+source = "git+https://github.com/O6lvl4/anyv-core?tag=v0.1.0#f87403d4718515039d43795fd478c69ce92480d9"
+dependencies = [
+ "anyhow",
+ "directories",
+ "flate2",
+ "hex",
+ "indicatif",
+ "reqwest",
+ "serde",
+ "sha2",
+ "tar",
+ "tokio",
+ "zip",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -483,9 +501,10 @@ dependencies = [
 
 [[package]]
 name = "gv-cli"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
+ "anyv-core",
  "clap",
  "clap_complete",
  "flate2",
@@ -504,9 +523,10 @@ dependencies = [
 
 [[package]]
 name = "gv-core"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
+ "anyv-core",
  "directories",
  "flate2",
  "futures",
@@ -527,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "gv-shim"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "gv-core",
 ]
